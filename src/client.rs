@@ -22,7 +22,14 @@ pub struct BridgeClient {
 impl BridgeClient {
     /// Create a new bridge client (doesn't start the bridge yet)
     pub fn new() -> Self {
-        let pipe_name = format!("\\\\.\\pipe\\j2534-bridge-{}", std::process::id());
+        use std::sync::atomic::AtomicU64 as Counter;
+        static INSTANCE: Counter = Counter::new(0);
+        let instance = INSTANCE.fetch_add(1, Ordering::SeqCst);
+        let pipe_name = format!(
+            "\\\\.\\pipe\\j2534-bridge-{}-{}",
+            std::process::id(),
+            instance
+        );
 
         Self {
             process: None,
@@ -33,6 +40,11 @@ impl BridgeClient {
         }
     }
 
+    /// Get the PID of the bridge process (if running)
+    pub fn pid(&self) -> Option<u32> {
+        self.process.as_ref().map(|c| c.id())
+    }
+
     /// Get the path to the bridge executable for the given bitness
     fn get_bridge_path(bitness: u8) -> Result<std::path::PathBuf, String> {
         let exe_dir = std::env::current_exe()
@@ -40,6 +52,7 @@ impl BridgeClient {
             .parent()
             .ok_or("Failed to get executable directory")?
             .to_path_buf();
+        let process_bits = (std::mem::size_of::<usize>() * 8) as u8;
 
         let bridge_name = if bitness == 32 {
             "j2534-bridge-32.exe"
@@ -60,11 +73,27 @@ impl BridgeClient {
             "x86_64-pc-windows-msvc"
         };
 
-        // Try release build first, then debug
-        for build_type in &["release", "debug"] {
-            // From src-tauri/target/<triple>/debug/ -> go up to repo root -> j2534-bridge/target/...
-            // Also try the shared crate location: ../../j2534-bridge/target/...
+        // Try debug build first so local development picks up the freshly built bridge.
+        for build_type in &["debug", "release"] {
+            // Support three development layouts:
+            // 1. Running inside j2534-bridge itself: target/debug/j2534-dump.exe
+            // 2. From a sibling app crate in the same workspace
+            // 3. From a separate repo pointing at ../j2534-bridge
             let candidates = [
+                // Local crate native build: only valid when requested bitness matches this process.
+                exe_dir.parent().and_then(|p| {
+                    if process_bits == bitness {
+                        Some(p.join(build_type).join("j2534-bridge.exe"))
+                    } else {
+                        None
+                    }
+                }),
+                // Local crate cross-target build: j2534-bridge/target/<triple>/debug/j2534-bridge.exe
+                exe_dir.parent().map(|p| {
+                    p.join(target_triple)
+                        .join(build_type)
+                        .join("j2534-bridge.exe")
+                }),
                 // Workspace sibling: CANcorder/j2534-bridge/target/...
                 exe_dir
                     .parent() // target/<triple>/

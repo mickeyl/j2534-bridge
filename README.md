@@ -115,6 +115,57 @@ Each message has an `id` field for request/response matching:
 
 `EnumerateDevices`, `Open`, `Close`, `SendMessage`, `SendMessagesBatch`, `WriteMessagesRaw`, `ReadMessages` (with drain parameters), `ReadMessagesWithLoopback`, `ReadMessagesRaw`, `ClearBuffers`, `ReadVersion`, `GetLastError`, `ReadBatteryVoltage`, `ReadProgrammingVoltage`, `StartPeriodicMessage`, `StopPeriodicMessage`, `ClearPeriodicMessages`, `AddFilter`, `AddFilterRaw`, `RemoveFilter`, `ClearFilters`, `GetConfig`, `SetConfig`, `GetLoopback`, `SetLoopback`, `GetDataRate`, `Shutdown`.
 
+## Test tool (`j2534-dump`)
+
+The crate includes a CLI test harness for exercising the bridge against real hardware.
+
+```bash
+# List detected J2534 adapters
+make list
+
+# Mixed-mode capture (11-bit + 29-bit) with raw diagnostics
+make dump DEVICE='OpenPort 2.0 J2534 ISO/CAN/VPW/PWM' BITNESS=32
+
+# Loopback stress test — TX known frames and verify round-trip
+make dump-stress-loopback DEVICE='OpenPort 2.0 J2534 ISO/CAN/VPW/PWM' BITNESS=32
+
+# Push harder: 5000 frames, zero delay
+make dump-stress-loopback DEVICE='...' BITNESS=32 EXTRA='--loopback-count 5000 --loopback-interval-ms 0'
+```
+
+### Available Makefile targets
+
+| Target | Description |
+|--------|-------------|
+| `list` | Enumerate J2534 devices |
+| `dump` | Mixed-mode capture with diagnostics |
+| `dump-std` / `dump-ext` / `dump-both` | Standard / extended / both ID capture with filters |
+| `dump-loopback` | Read with loopback echoes enabled |
+| `dump-stress-loopback` | TX/RX loopback stress test with payload verification |
+| `dump-raw` | Raw J2534 result codes |
+| `dump-isotp` | ISO 15765 (ISO-TP) capture |
+
+### Stress-loopback parameters
+
+| CLI flag | Default | Description |
+|----------|---------|-------------|
+| `--loopback-count` | 100 | Number of frames to send |
+| `--loopback-id` | `0x7DF` | Arbitration ID for TX frames |
+| `--loopback-extended` | off | Use 29-bit extended IDs |
+| `--loopback-interval-ms` | 10 | Delay between TX frames (0 = max throughput) |
+
+## Known issues with selected adapters
+
+### OBDX Pro FT — no 29-bit CAN receive
+
+The OBDX Pro FT driver does not return 29-bit (extended) CAN frames in mixed-mode capture. This has been confirmed independently using SavvyCAN (Qt5-based J2534 tool) on the same bus and adapter — the issue is in the OBDX driver, not this bridge.
+
+- `CAN_ID_BOTH` (`0x800`) alone fails to open on OBDX; `CAN_ID_BOTH | CAN_29BIT_ID` (`0x900`) is required.
+- With `0x900`, the channel opens but only 11-bit frames are received.
+- The same bridge code with a Tactrix OpenPort 2.0 on the same bus correctly receives both 11-bit and 29-bit traffic.
+
+If you need 29-bit capture with OBDX, contact the vendor for a driver update.
+
 ## Diagnostics
 
 Set `J2534_BRIDGE_VERBOSE=1` to log all requests and responses to stderr.

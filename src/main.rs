@@ -202,7 +202,6 @@ fn handle_request(
     match request {
         Request::EnumerateDevices => {
             let devices = j2534::enumerate_devices();
-            let process_bits = (std::mem::size_of::<usize>() * 8) as u8;
             let device_infos: Vec<DeviceInfo> = devices
                 .into_iter()
                 .map(|d| DeviceInfo {
@@ -212,11 +211,7 @@ fn handle_request(
                     can_iso15765: d.can_iso15765,
                     can_iso11898: d.can_iso11898,
                     compatible: d.compatible,
-                    bitness: if d.compatible {
-                        process_bits
-                    } else {
-                        if process_bits == 64 { 32 } else { 64 }
-                    },
+                    bitness: d.bitness,
                 })
                 .collect();
             Response::ok(ResponseData::Devices(device_infos))
@@ -326,6 +321,9 @@ fn handle_request(
                                     arb_id: m.arb_id,
                                     extended: m.extended,
                                     data: m.data,
+                                    raw_arb_id: m.raw_arb_id,
+                                    rx_status: m.rx_status,
+                                    data_size: m.data_size,
                                 })
                                 .collect();
                             Response::ok(ResponseData::Messages(can_messages))
@@ -349,6 +347,9 @@ fn handle_request(
                                 arb_id: m.arb_id,
                                 extended: m.extended,
                                 data: m.data,
+                                raw_arb_id: m.raw_arb_id,
+                                rx_status: m.rx_status,
+                                data_size: m.data_size,
                             })
                             .collect();
                         Response::ok(ResponseData::Messages(can_messages))

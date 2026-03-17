@@ -193,6 +193,9 @@ pub struct CanMessage {
     pub arb_id: u32,
     pub extended: bool,
     pub data: Vec<u8>,
+    pub raw_arb_id: u32,
+    pub rx_status: u32,
+    pub data_size: u32,
 }
 
 /// Message for batch sending
