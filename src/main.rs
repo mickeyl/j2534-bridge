@@ -13,7 +13,8 @@ mod j2534;
 mod protocol;
 
 use protocol::{
-    CanMessage, DeviceInfo, Message, RawIoResult, Request, Response, ResponseData, VersionInfo,
+    CanMessage, DeviceInfo, KlineInitResult, Message, RawIoResult, Request, Response, ResponseData,
+    VersionInfo,
 };
 use std::io::{BufRead, BufReader, Write};
 use std::panic::{self, AssertUnwindSafe};
@@ -324,6 +325,7 @@ fn handle_request(
                                     raw_arb_id: m.raw_arb_id,
                                     rx_status: m.rx_status,
                                     data_size: m.data_size,
+                                    protocol_id: m.protocol_id,
                                 })
                                 .collect();
                             Response::ok(ResponseData::Messages(can_messages))
@@ -350,6 +352,7 @@ fn handle_request(
                                 raw_arb_id: m.raw_arb_id,
                                 rx_status: m.rx_status,
                                 data_size: m.data_size,
+                                protocol_id: m.protocol_id,
                             })
                             .collect();
                         Response::ok(ResponseData::Messages(can_messages))
@@ -432,6 +435,97 @@ fn handle_request(
                     Ok(v) => Response::ok(ResponseData::Float(v)),
                     Err(e) => Response::error(-1, e),
                 },
+                None => Response::error(-1, "Not connected"),
+            }
+        }
+
+        Request::FastInit { data } => {
+            let conn_guard = connection.lock().unwrap();
+            match conn_guard.as_ref() {
+                Some(conn) => match conn.fast_init(data) {
+                    Ok(msg) => Response::ok(ResponseData::Messages(vec![CanMessage {
+                        timestamp_us: msg.timestamp_us,
+                        arb_id: msg.arb_id,
+                        extended: msg.extended,
+                        data: msg.data,
+                        raw_arb_id: msg.raw_arb_id,
+                        rx_status: msg.rx_status,
+                        data_size: msg.data_size,
+                        protocol_id: msg.protocol_id,
+                    }])),
+                    Err(e) => Response::error(-1, e),
+                },
+                None => Response::error(-1, "Not connected"),
+            }
+        }
+
+        Request::FiveBaudInit { data } => {
+            let conn_guard = connection.lock().unwrap();
+            match conn_guard.as_ref() {
+                Some(conn) => match conn.five_baud_init(data) {
+                    Ok(msg) => Response::ok(ResponseData::Messages(vec![CanMessage {
+                        timestamp_us: msg.timestamp_us,
+                        arb_id: msg.arb_id,
+                        extended: msg.extended,
+                        data: msg.data,
+                        raw_arb_id: msg.raw_arb_id,
+                        rx_status: msg.rx_status,
+                        data_size: msg.data_size,
+                        protocol_id: msg.protocol_id,
+                    }])),
+                    Err(e) => Response::error(-1, e),
+                },
+                None => Response::error(-1, "Not connected"),
+            }
+        }
+
+        Request::KlineInit {
+            init_mode,
+            fast_init_data,
+            five_baud_address,
+            cc_timeout_ms,
+        } => {
+            let conn_guard = connection.lock().unwrap();
+            match conn_guard.as_ref() {
+                Some(conn) => {
+                    let mode_str = match init_mode {
+                        protocol::KlineInitMode::Fast => "fast",
+                        protocol::KlineInitMode::Slow => "slow",
+                        protocol::KlineInitMode::Auto => "auto",
+                    };
+                    let cc_ms = cc_timeout_ms.unwrap_or(300);
+                    match conn.kline_init(
+                        mode_str,
+                        fast_init_data.as_deref(),
+                        five_baud_address.as_deref(),
+                        cc_ms,
+                    ) {
+                        Ok(result) => {
+                            let msgs: Vec<CanMessage> = result
+                                .init_response
+                                .into_iter()
+                                .map(|m| CanMessage {
+                                    timestamp_us: m.timestamp_us,
+                                    arb_id: m.arb_id,
+                                    extended: m.extended,
+                                    data: m.data,
+                                    raw_arb_id: m.raw_arb_id,
+                                    rx_status: m.rx_status,
+                                    data_size: m.data_size,
+                                    protocol_id: m.protocol_id,
+                                })
+                                .collect();
+                            Response::ok(ResponseData::KlineInit(KlineInitResult {
+                                init_method: result.init_method,
+                                detected_protocol: result.detected_protocol,
+                                keyword_bytes: result.keyword_bytes,
+                                cc_received: result.cc_received,
+                                init_response: msgs,
+                            }))
+                        }
+                        Err(e) => Response::error(-1, e),
+                    }
+                }
                 None => Response::error(-1, "Not connected"),
             }
         }

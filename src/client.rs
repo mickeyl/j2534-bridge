@@ -66,6 +66,32 @@ impl BridgeClient {
             return Ok(bridge_path);
         }
 
+        // In development, prefer the explicitly published bridge binaries.
+        // This avoids accidentally launching an older cross-target artifact from target/.
+        let dev_published_candidates = [
+            exe_dir
+                .parent() // target/<triple>/
+                .and_then(|p| p.parent()) // target/
+                .and_then(|p| p.parent()) // src-tauri/
+                .map(|p| p.join("bin").join(bridge_name)),
+            exe_dir
+                .parent()
+                .and_then(|p| p.parent())
+                .and_then(|p| p.parent())
+                .and_then(|p| p.parent()) // CANcorder/
+                .map(|p| p.join("src-tauri").join("bin").join(bridge_name)),
+        ];
+
+        for candidate in dev_published_candidates.iter().flatten() {
+            eprintln!(
+                "[j2534-client] Looking for published dev bridge at: {:?}",
+                candidate
+            );
+            if candidate.exists() {
+                return Ok(candidate.clone());
+            }
+        }
+
         // Try in the j2534-bridge target directory (for development)
         let target_triple = if bitness == 32 {
             "i686-pc-windows-msvc"
@@ -150,8 +176,11 @@ impl BridgeClient {
         }
 
         let bridge_path = Self::get_bridge_path(bitness)?;
-        eprintln!("[j2534-client] Starting bridge: {:?}", bridge_path);
-        eprintln!("[j2534-client] Pipe name: {}", self.pipe_name);
+        eprintln!(
+            "[J2534_DEBUG] j2534-client starting bridge bitness={} path={:?}",
+            bitness, bridge_path
+        );
+        eprintln!("[J2534_DEBUG] j2534-client pipe={}", self.pipe_name);
 
         // Start the bridge process
         let child = Command::new(&bridge_path)
@@ -481,6 +510,57 @@ impl BridgeClient {
         let response = self.send_request(Request::ReadProgrammingVoltage)?;
         match response {
             Response::Ok { data: ResponseData::Float(v) } => Ok(v),
+            Response::Ok { .. } => Err("Unexpected response type".to_string()),
+            Response::Error { message, .. } => Err(message),
+        }
+    }
+
+    pub fn fast_init(&mut self, data: &[u8]) -> Result<CanMessage, String> {
+        let response = self.send_request(Request::FastInit {
+            data: data.to_vec(),
+        })?;
+        match response {
+            Response::Ok { data: ResponseData::Messages(mut msgs) } => msgs
+                .drain(..)
+                .next()
+                .ok_or_else(|| "No FAST_INIT response message returned".to_string()),
+            Response::Ok { .. } => Err("Unexpected response type".to_string()),
+            Response::Error { message, .. } => Err(message),
+        }
+    }
+
+    pub fn five_baud_init(&mut self, data: &[u8]) -> Result<CanMessage, String> {
+        let response = self.send_request(Request::FiveBaudInit {
+            data: data.to_vec(),
+        })?;
+        match response {
+            Response::Ok { data: ResponseData::Messages(mut msgs) } => msgs
+                .drain(..)
+                .next()
+                .ok_or_else(|| "No FIVE_BAUD_INIT response message returned".to_string()),
+            Response::Ok { .. } => Err("Unexpected response type".to_string()),
+            Response::Error { message, .. } => Err(message),
+        }
+    }
+
+    /// Full K-Line init (fast/slow/auto) with CC polling — runs inside bridge.
+    pub fn kline_init(
+        &mut self,
+        init_mode: crate::protocol::KlineInitMode,
+        fast_init_data: Option<Vec<u8>>,
+        five_baud_address: Option<Vec<u8>>,
+        cc_timeout_ms: Option<u32>,
+    ) -> Result<crate::protocol::KlineInitResult, String> {
+        let response = self.send_request(Request::KlineInit {
+            init_mode,
+            fast_init_data,
+            five_baud_address,
+            cc_timeout_ms,
+        })?;
+        match response {
+            Response::Ok {
+                data: ResponseData::KlineInit(r),
+            } => Ok(r),
             Response::Ok { .. } => Err("Unexpected response type".to_string()),
             Response::Error { message, .. } => Err(message),
         }

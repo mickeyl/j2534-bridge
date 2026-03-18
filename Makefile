@@ -2,6 +2,9 @@ SHELL := /bin/sh
 
 CARGO ?= cargo
 BUILD_TARGET :=
+WIN32_TARGET := i686-pc-windows-msvc
+WIN64_TARGET := x86_64-pc-windows-msvc
+DEV_BIN_DIR := ../CANcorder/src-tauri/bin
 DEVICE ?=
 DLL ?=
 BITNESS ?=
@@ -26,16 +29,16 @@ BITNESS_ARG := --bitness $(BITNESS)
 endif
 
 ifeq ($(strip $(BITNESS)),32)
-BUILD_TARGET := --target i686-pc-windows-msvc
+BUILD_TARGET := --target $(WIN32_TARGET)
 endif
 
 ifeq ($(strip $(BITNESS)),64)
-BUILD_TARGET := --target x86_64-pc-windows-msvc
+BUILD_TARGET := --target $(WIN64_TARGET)
 endif
 
 DUMP = $(CARGO) run --bin j2534-dump -- $(SELECTOR) $(BITNESS_ARG) --baud-rate $(BAUD) --timeout-ms $(TIMEOUT_MS) --batch-size $(BATCH_SIZE) --max-drain-reads $(MAX_DRAIN_READS) --interface $(INTERFACE)
 
-.PHONY: help build ensure-bridge list dump dump-std dump-ext dump-both dump-loopback dump-stress-loopback dump-raw dump-isotp
+.PHONY: help build ensure-bridge ensure-bridge-dev publish-dev list dump dump-std dump-ext dump-both dump-loopback dump-stress-loopback dump-raw dump-isotp
 
 help:
 	@echo "j2534-bridge test presets"
@@ -50,6 +53,7 @@ help:
 	@echo ""
 	@echo "Targets:"
 	@echo "  make list"
+	@echo "  make ensure-bridge-dev     Build and publish fresh dev bridge binaries for CANcorder"
 	@echo "  make dump DEVICE='My Adapter'"
 	@echo "  make dump-std DEVICE='My Adapter'"
 	@echo "  make dump-ext DEVICE='My Adapter'"
@@ -60,6 +64,15 @@ help:
 
 ensure-bridge:
 	$(CARGO) build $(BUILD_TARGET) --bin j2534-bridge
+
+ensure-bridge-dev:
+	$(CARGO) build --target $(WIN32_TARGET) --bin j2534-bridge
+	$(CARGO) build --target $(WIN64_TARGET) --bin j2534-bridge
+	@mkdir -p "$(DEV_BIN_DIR)"
+	cp "target/$(WIN32_TARGET)/debug/j2534-bridge.exe" "$(DEV_BIN_DIR)/j2534-bridge-32.exe"
+	cp "target/$(WIN64_TARGET)/debug/j2534-bridge.exe" "$(DEV_BIN_DIR)/j2534-bridge-64.exe"
+
+publish-dev: ensure-bridge-dev
 
 list: ensure-bridge
 	$(CARGO) run --bin j2534-dump -- $(BITNESS_ARG) --list

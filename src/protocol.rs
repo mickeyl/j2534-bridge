@@ -74,6 +74,25 @@ pub enum Request {
     /// Read programming voltage
     ReadProgrammingVoltage,
 
+    /// Perform ISO/K-Line fast init and return the reply message
+    FastInit { data: Vec<u8> },
+
+    /// Perform ISO/K-Line five-baud init and return the reply message
+    FiveBaudInit { data: Vec<u8> },
+
+    /// Full K-Line autodetection and initialization (fast/slow/auto) with
+    /// CC acknowledgment polling — runs entirely inside the bridge process
+    /// to guarantee correct timing.
+    KlineInit {
+        init_mode: KlineInitMode,
+        #[serde(default)]
+        fast_init_data: Option<Vec<u8>>,
+        #[serde(default)]
+        five_baud_address: Option<Vec<u8>>,
+        #[serde(default)]
+        cc_timeout_ms: Option<u32>,
+    },
+
     /// Start a periodic message
     StartPeriodicMessage {
         arb_id: u32,
@@ -148,6 +167,31 @@ pub enum Response {
     Error { code: i32, message: String },
 }
 
+/// K-Line initialization mode
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KlineInitMode {
+    Fast,
+    Slow,
+    Auto,
+}
+
+/// Result of a server-side KlineInit command
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KlineInitResult {
+    /// Which method succeeded: "fast" or "slow"
+    pub init_method: String,
+    /// Detected protocol: "iso14230-fast", "iso9141", "iso14230-slow"
+    pub detected_protocol: String,
+    /// Keyword bytes from five-baud init (empty for fast init)
+    pub keyword_bytes: Vec<u8>,
+    /// Whether the ECU's 0xCC acknowledgment was received (slow init only)
+    pub cc_received: bool,
+    /// The init IOCTL response, plus any post-init frames (e.g. CC byte)
+    pub init_response: Vec<CanMessage>,
+}
+
 /// Data payload for successful responses
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -156,6 +200,7 @@ pub enum ResponseData {
     Devices(Vec<DeviceInfo>),
     Connected,
     Messages(Vec<CanMessage>),
+    KlineInit(KlineInitResult),
     RawIo(RawIoResult),
     Version(VersionInfo),
     String(String),
@@ -185,7 +230,7 @@ pub struct DeviceInfo {
     pub bitness: u8,
 }
 
-/// CAN message
+/// CAN / K-Line message
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CanMessage {
@@ -196,6 +241,13 @@ pub struct CanMessage {
     pub raw_arb_id: u32,
     pub rx_status: u32,
     pub data_size: u32,
+    /// J2534 protocol ID (5=CAN, 3=ISO9141, 4=ISO14230, etc.)
+    #[serde(default = "default_protocol_can")]
+    pub protocol_id: u32,
+}
+
+fn default_protocol_can() -> u32 {
+    5 // PROTOCOL_CAN
 }
 
 /// Message for batch sending

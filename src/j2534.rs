@@ -299,6 +299,22 @@ pub struct CANMessage {
     pub raw_arb_id: u32,
     pub rx_status: u32,
     pub data_size: u32,
+    /// J2534 protocol ID (5=CAN, 3=ISO9141, 4=ISO14230, etc.)
+    #[serde(default = "default_protocol_can")]
+    pub protocol_id: u32,
+}
+
+/// Bridge-internal result of a full K-Line init sequence.
+pub struct KlineInitResult {
+    pub init_method: String,
+    pub detected_protocol: String,
+    pub keyword_bytes: Vec<u8>,
+    pub cc_received: bool,
+    pub init_response: Vec<CANMessage>,
+}
+
+fn default_protocol_can() -> u32 {
+    PROTOCOL_CAN
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -323,6 +339,37 @@ pub struct RawIoResult {
     pub num_msgs: u32,
 }
 
+fn passthru_msg_to_can_message(msg: &PassThruMsg) -> CANMessage {
+    let is_can = msg.protocol_id == PROTOCOL_CAN || msg.protocol_id == PROTOCOL_ISO15765;
+    if is_can && msg.data_size >= 4 {
+        let arb_id = u32::from_be_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
+        let data_len = (msg.data_size - 4) as usize;
+        let data = msg.data[4..4 + data_len].to_vec();
+        CANMessage {
+            timestamp_us: msg.timestamp as u64,
+            arb_id,
+            extended: (msg.rx_status & RX_CAN_29BIT_ID) != 0,
+            data,
+            raw_arb_id: arb_id,
+            rx_status: msg.rx_status,
+            data_size: msg.data_size,
+            protocol_id: msg.protocol_id,
+        }
+    } else {
+        let data = msg.data[..msg.data_size as usize].to_vec();
+        CANMessage {
+            timestamp_us: msg.timestamp as u64,
+            arb_id: 0,
+            extended: false,
+            data,
+            raw_arb_id: 0,
+            rx_status: msg.rx_status,
+            data_size: msg.data_size,
+            protocol_id: msg.protocol_id,
+        }
+    }
+}
+
 /// SCONFIG structure for GET_CONFIG/SET_CONFIG
 #[repr(C)]
 #[derive(Debug, Clone)]
@@ -337,6 +384,14 @@ pub struct SConfig {
 pub struct SConfigList {
     pub num_of_params: u32,
     pub config_ptr: *mut SConfig,
+}
+
+/// SBYTE_ARRAY structure used by certain IOCTLs such as FIVE_BAUD_INIT.
+#[repr(C)]
+#[derive(Debug)]
+pub struct SByteArray {
+    pub num_of_bytes: u32,
+    pub byte_ptr: *mut u8,
 }
 
 /// Tracks a recently sent message for TX echo filtering
@@ -602,14 +657,63 @@ impl J2534Connection {
             message: Some(format!("Channel ID: {}", channel_id)),
         });
 
-        // Set up pass-all filter (CAN protocols only; ISO 9141/K-Line does not require filters)
+        // Set up pass-all message filter.
+        // CAN protocols need a 4-byte (arb-id) mask/pattern.
+        // ISO 9141 / ISO 14230 (K-Line) also need a filter — many J2534 drivers
+        // will not deliver any PassThruReadMsgs data until at least one filter is
+        // configured.  The can-opener klogger reference uses a 1-byte pass-all.
         let is_can_protocol = protocol_id == PROTOCOL_CAN || protocol_id == PROTOCOL_ISO15765;
+        let is_kline_protocol = protocol_id == PROTOCOL_ISO9141 || protocol_id == PROTOCOL_ISO14230;
+        let needs_filter = is_can_protocol || is_kline_protocol;
 
         progress_callback(J2534Progress {
             step: "set_filter".to_string(),
-            status: if is_can_protocol { "in_progress" } else { "success" }.to_string(),
-            message: if is_can_protocol { None } else { Some("Skipped (not required for this protocol)".to_string()) },
+            status: if needs_filter { "in_progress" } else { "success" }.to_string(),
+            message: if needs_filter { None } else { Some("Skipped (not required for this protocol)".to_string()) },
         });
+
+        if is_kline_protocol {
+            unsafe {
+                let filter_fn: Symbol<PassThruStartMsgFilterFn> = library
+                    .get(b"PassThruStartMsgFilter\0")
+                    .map_err(|e| {
+                        format!("ERR_J2534_FUNC_NOT_FOUND: PassThruStartMsgFilter - {}", e)
+                    })?;
+
+                // Pass-all filter for K-Line: 1-byte mask=0x00, pattern=0x00
+                let mut mask_msg = PassThruMsg::default();
+                mask_msg.protocol_id = protocol_id;
+                mask_msg.data_size = 1;
+                // data[0] already 0 = match everything
+
+                let mut pattern_msg = PassThruMsg::default();
+                pattern_msg.protocol_id = protocol_id;
+                pattern_msg.data_size = 1;
+
+                let mut filter_id: c_ulong = 0;
+                let result = filter_fn(
+                    channel_id,
+                    PASS_FILTER,
+                    &mask_msg,
+                    &pattern_msg,
+                    std::ptr::null(),
+                    &mut filter_id,
+                );
+                if result != STATUS_NOERROR {
+                    eprintln!(
+                        "[j2534] Warning: K-Line pass-all filter failed: {} ({}). RX may not work.",
+                        result,
+                        error_code_to_string(result)
+                    );
+                }
+            }
+
+            progress_callback(J2534Progress {
+                step: "set_filter".to_string(),
+                status: "success".to_string(),
+                message: Some("K-Line pass-all filter".to_string()),
+            });
+        }
 
         if is_can_protocol {
             unsafe {
@@ -811,18 +915,25 @@ impl J2534Connection {
     pub fn send_message(&self, arb_id: u32, data: &[u8], extended: bool) -> Result<(), String> {
         let mut msg = PassThruMsg::default();
         msg.protocol_id = self.protocol_id;
-        msg.tx_flags = if extended { CAN_29BIT_ID } else { 0 };
+        let is_can = self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765;
+        let data_len = if is_can {
+            msg.tx_flags = if extended { CAN_29BIT_ID } else { 0 };
+            msg.data[0] = ((arb_id >> 24) & 0xFF) as u8;
+            msg.data[1] = ((arb_id >> 16) & 0xFF) as u8;
+            msg.data[2] = ((arb_id >> 8) & 0xFF) as u8;
+            msg.data[3] = (arb_id & 0xFF) as u8;
 
-        // First 4 bytes are the CAN ID
-        msg.data[0] = ((arb_id >> 24) & 0xFF) as u8;
-        msg.data[1] = ((arb_id >> 16) & 0xFF) as u8;
-        msg.data[2] = ((arb_id >> 8) & 0xFF) as u8;
-        msg.data[3] = (arb_id & 0xFF) as u8;
-
-        // Copy data bytes (CAN limited to 8 bytes)
-        let data_len = data.len().min(8);
-        msg.data[4..4 + data_len].copy_from_slice(&data[..data_len]);
-        msg.data_size = (4 + data_len) as u32;
+            let data_len = data.len().min(8);
+            msg.data[4..4 + data_len].copy_from_slice(&data[..data_len]);
+            msg.data_size = (4 + data_len) as u32;
+            data_len
+        } else {
+            msg.tx_flags = 0;
+            let data_len = data.len().min(msg.data.len());
+            msg.data[..data_len].copy_from_slice(&data[..data_len]);
+            msg.data_size = data_len as u32;
+            data_len
+        };
 
         let mut num_msgs: c_ulong = 1;
 
@@ -873,18 +984,23 @@ impl J2534Connection {
             .map(|(arb_id, data, extended)| {
                 let mut msg = PassThruMsg::default();
                 msg.protocol_id = self.protocol_id;
-                msg.tx_flags = if *extended { CAN_29BIT_ID } else { 0 };
+                let is_can = self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765;
+                if is_can {
+                    msg.tx_flags = if *extended { CAN_29BIT_ID } else { 0 };
+                    msg.data[0] = ((arb_id >> 24) & 0xFF) as u8;
+                    msg.data[1] = ((arb_id >> 16) & 0xFF) as u8;
+                    msg.data[2] = ((arb_id >> 8) & 0xFF) as u8;
+                    msg.data[3] = (arb_id & 0xFF) as u8;
 
-                // First 4 bytes are the CAN ID
-                msg.data[0] = ((arb_id >> 24) & 0xFF) as u8;
-                msg.data[1] = ((arb_id >> 16) & 0xFF) as u8;
-                msg.data[2] = ((arb_id >> 8) & 0xFF) as u8;
-                msg.data[3] = (arb_id & 0xFF) as u8;
-
-                // Copy data bytes (CAN limited to 8 bytes)
-                let data_len = data.len().min(8);
-                msg.data[4..4 + data_len].copy_from_slice(&data[..data_len]);
-                msg.data_size = (4 + data_len) as u32;
+                    let data_len = data.len().min(8);
+                    msg.data[4..4 + data_len].copy_from_slice(&data[..data_len]);
+                    msg.data_size = (4 + data_len) as u32;
+                } else {
+                    msg.tx_flags = 0;
+                    let data_len = data.len().min(msg.data.len());
+                    msg.data[..data_len].copy_from_slice(&data[..data_len]);
+                    msg.data_size = data_len as u32;
+                }
 
                 msg
             })
@@ -923,7 +1039,11 @@ impl J2534Connection {
             sent.retain(|m| m.timestamp > cutoff);
 
             for (arb_id, data, _) in messages.iter().take(num_msgs as usize) {
-                let data_len = data.len().min(8);
+                let data_len = if self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765 {
+                    data.len().min(8)
+                } else {
+                    data.len()
+                };
                 sent.push(SentMessage {
                     arb_id: *arb_id,
                     data: data[..data_len].to_vec(),
@@ -953,16 +1073,23 @@ impl J2534Connection {
             .map(|(arb_id, data, extended)| {
                 let mut msg = PassThruMsg::default();
                 msg.protocol_id = self.protocol_id;
-                msg.tx_flags = if *extended { CAN_29BIT_ID } else { 0 };
+                let is_can = self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765;
+                if is_can {
+                    msg.tx_flags = if *extended { CAN_29BIT_ID } else { 0 };
+                    msg.data[0] = ((arb_id >> 24) & 0xFF) as u8;
+                    msg.data[1] = ((arb_id >> 16) & 0xFF) as u8;
+                    msg.data[2] = ((arb_id >> 8) & 0xFF) as u8;
+                    msg.data[3] = (arb_id & 0xFF) as u8;
 
-                msg.data[0] = ((arb_id >> 24) & 0xFF) as u8;
-                msg.data[1] = ((arb_id >> 16) & 0xFF) as u8;
-                msg.data[2] = ((arb_id >> 8) & 0xFF) as u8;
-                msg.data[3] = (arb_id & 0xFF) as u8;
-
-                let data_len = data.len().min(8);
-                msg.data[4..4 + data_len].copy_from_slice(&data[..data_len]);
-                msg.data_size = (4 + data_len) as u32;
+                    let data_len = data.len().min(8);
+                    msg.data[4..4 + data_len].copy_from_slice(&data[..data_len]);
+                    msg.data_size = (4 + data_len) as u32;
+                } else {
+                    msg.tx_flags = 0;
+                    let data_len = data.len().min(msg.data.len());
+                    msg.data[..data_len].copy_from_slice(&data[..data_len]);
+                    msg.data_size = data_len as u32;
+                }
 
                 msg
             })
@@ -990,7 +1117,11 @@ impl J2534Connection {
             sent.retain(|m| m.timestamp > cutoff);
 
             for (arb_id, data, _) in messages.iter().take(num_msgs as usize) {
-                let data_len = data.len().min(8);
+                let data_len = if self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765 {
+                    data.len().min(8)
+                } else {
+                    data.len()
+                };
                 sent.push(SentMessage {
                     arb_id: *arb_id,
                     data: data[..data_len].to_vec(),
@@ -1076,6 +1207,8 @@ impl J2534Connection {
             }
         }
 
+        let is_can = self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765;
+
         for i in 0..num_msgs as usize {
             let msg = &msg_buffer[i];
 
@@ -1085,7 +1218,12 @@ impl J2534Connection {
                 continue;
             }
 
-            if msg.data_size >= 4 {
+            if is_can {
+                // CAN/ISO15765: first 4 bytes are arb_id, rest is payload
+                if msg.data_size < 4 {
+                    continue;
+                }
+
                 let arb_id = ((msg.data[0] as u32) << 24)
                     | ((msg.data[1] as u32) << 16)
                     | ((msg.data[2] as u32) << 8)
@@ -1096,22 +1234,17 @@ impl J2534Connection {
                 let extended = (msg.rx_status & RX_CAN_29BIT_ID) != 0;
 
                 // Driver workaround: filter out TX echoes by matching against recently sent messages
-                // Some drivers don't set TX_MSG_TYPE flag even when loopback is enabled
-                // Skip this filter if include_loopback is true
                 let is_tx_echo = if include_loopback {
                     false
                 } else if let Ok(mut sent) = self.sent_messages.lock() {
-                    // Clean up old entries while we have the lock
                     let cutoff =
                         std::time::Instant::now() - std::time::Duration::from_millis(500);
                     sent.retain(|m| m.timestamp > cutoff);
 
-                    // Check if this message matches any recently sent message
                     if let Some(pos) = sent
                         .iter()
                         .position(|m| m.arb_id == arb_id && m.data == data)
                     {
-                        // Remove the matched entry so we only filter once per send
                         sent.remove(pos);
                         true
                     } else {
@@ -1126,13 +1259,32 @@ impl J2534Connection {
                 }
 
                 messages.push(CANMessage {
-                    timestamp_us: msg.timestamp as u64, // Raw J2534 device timestamp
+                    timestamp_us: msg.timestamp as u64,
                     arb_id,
                     extended,
                     data,
                     raw_arb_id: arb_id,
                     rx_status: msg.rx_status,
                     data_size: msg.data_size,
+                    protocol_id: msg.protocol_id,
+                });
+            } else {
+                // ISO 9141 / ISO 14230 (K-Line): all bytes are raw serial data, no arb_id
+                if msg.data_size == 0 {
+                    continue;
+                }
+
+                let data = msg.data[..msg.data_size as usize].to_vec();
+
+                messages.push(CANMessage {
+                    timestamp_us: msg.timestamp as u64,
+                    arb_id: 0,
+                    extended: false,
+                    data,
+                    raw_arb_id: 0,
+                    rx_status: msg.rx_status,
+                    data_size: msg.data_size,
+                    protocol_id: msg.protocol_id,
                 });
             }
         }
@@ -1159,6 +1311,7 @@ impl J2534Connection {
     ) -> Result<Vec<CANMessage>, String> {
         let batch_size = batch_size.clamp(1, 256) as usize;
         let max_drain_reads = max_drain_reads.clamp(1, 256) as usize;
+        let is_can = self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765;
         let mut all_messages = Vec::new();
         let mut msg_buffer: Vec<PassThruMsg> =
             (0..batch_size).map(|_| PassThruMsg::default()).collect();
@@ -1206,51 +1359,73 @@ impl J2534Connection {
                     continue;
                 }
 
-                if msg.data_size < 4 {
-                    continue;
-                }
+                if is_can {
+                    // CAN/ISO15765: first 4 bytes are arb_id, rest is payload
+                    if msg.data_size < 4 {
+                        continue;
+                    }
 
-                let arb_id = u32::from_be_bytes([
-                    msg.data[0],
-                    msg.data[1],
-                    msg.data[2],
-                    msg.data[3],
-                ]);
-                let data_len = (msg.data_size - 4) as usize;
-                let data = msg.data[4..4 + data_len].to_vec();
-                let extended = (msg.rx_status & RX_CAN_29BIT_ID) != 0;
+                    let arb_id = u32::from_be_bytes([
+                        msg.data[0],
+                        msg.data[1],
+                        msg.data[2],
+                        msg.data[3],
+                    ]);
+                    let data_len = (msg.data_size - 4) as usize;
+                    let data = msg.data[4..4 + data_len].to_vec();
+                    let extended = (msg.rx_status & RX_CAN_29BIT_ID) != 0;
 
-                // Driver workaround: filter TX echoes by matching sent_messages
-                let is_echo = if let Ok(mut sent) = self.sent_messages.lock() {
-                    let cutoff =
-                        std::time::Instant::now() - std::time::Duration::from_millis(500);
-                    sent.retain(|m| m.timestamp > cutoff);
+                    // Driver workaround: filter TX echoes by matching sent_messages
+                    let is_echo = if let Ok(mut sent) = self.sent_messages.lock() {
+                        let cutoff =
+                            std::time::Instant::now() - std::time::Duration::from_millis(500);
+                        sent.retain(|m| m.timestamp > cutoff);
 
-                    if let Some(pos) =
-                        sent.iter().position(|m| m.arb_id == arb_id && m.data == data)
-                    {
-                        sent.remove(pos);
-                        true
+                        if let Some(pos) =
+                            sent.iter().position(|m| m.arb_id == arb_id && m.data == data)
+                        {
+                            sent.remove(pos);
+                            true
+                        } else {
+                            false
+                        }
                     } else {
                         false
+                    };
+
+                    if is_echo {
+                        continue;
                     }
+
+                    all_messages.push(CANMessage {
+                        timestamp_us: msg.timestamp as u64,
+                        arb_id,
+                        extended,
+                        data,
+                        raw_arb_id: arb_id,
+                        rx_status: msg.rx_status,
+                        data_size: msg.data_size,
+                        protocol_id: msg.protocol_id,
+                    });
                 } else {
-                    false
-                };
+                    // ISO 9141 / ISO 14230 (K-Line): all bytes are raw serial data
+                    if msg.data_size == 0 {
+                        continue;
+                    }
 
-                if is_echo {
-                    continue;
+                    let data = msg.data[..msg.data_size as usize].to_vec();
+
+                    all_messages.push(CANMessage {
+                        timestamp_us: msg.timestamp as u64,
+                        arb_id: 0,
+                        extended: false,
+                        data,
+                        raw_arb_id: 0,
+                        rx_status: msg.rx_status,
+                        data_size: msg.data_size,
+                        protocol_id: msg.protocol_id,
+                    });
                 }
-
-                all_messages.push(CANMessage {
-                    timestamp_us: msg.timestamp as u64,
-                    arb_id,
-                    extended,
-                    data,
-                    raw_arb_id: arb_id,
-                    rx_status: msg.rx_status,
-                    data_size: msg.data_size,
-                });
             }
 
             // If we got fewer than batch_size, buffer is drained
@@ -1328,6 +1503,7 @@ impl J2534Connection {
                         raw_arb_id: arb_id,
                         rx_status: msg.rx_status,
                         data_size: msg.data_size,
+                        protocol_id: msg.protocol_id,
                     });
                 }
 
@@ -1850,6 +2026,202 @@ impl J2534Connection {
     /// Get the current data rate
     pub fn get_data_rate(&self) -> Result<u32, String> {
         self.get_config(DATA_RATE)
+    }
+
+    pub fn fast_init(&self, data: &[u8]) -> Result<CANMessage, String> {
+        let mut input = PassThruMsg::default();
+        input.protocol_id = self.protocol_id;
+        input.data_size = data.len() as u32;
+        input.data[..data.len()].copy_from_slice(data);
+        let mut output = PassThruMsg::default();
+
+        unsafe {
+            let ioctl_fn: Symbol<PassThruIoctlFn> = self
+                .library
+                .get(b"PassThruIoctl\0")
+                .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruIoctl - {}", e))?;
+
+            let result = ioctl_fn(
+                self.channel_id,
+                FAST_INIT,
+                &mut input as *mut PassThruMsg as *mut c_void,
+                &mut output as *mut PassThruMsg as *mut c_void,
+            );
+
+            if result != STATUS_NOERROR {
+                let last_error = get_last_error_message(&self.library);
+                return Err(format!(
+                    "ERR_J2534_FAST_INIT_FAILED: error code {} ({}){}",
+                    result,
+                    error_code_to_string(result),
+                    last_error
+                        .map(|s| format!(" - {}", s))
+                        .unwrap_or_default()
+                ));
+            }
+        }
+
+        Ok(passthru_msg_to_can_message(&output))
+    }
+
+    /// Full K-Line init with CC polling — runs entirely in-process.
+    pub fn kline_init(
+        &self,
+        mode: &str,
+        fast_init_data: Option<&[u8]>,
+        five_baud_address: Option<&[u8]>,
+        cc_timeout_ms: u32,
+    ) -> Result<KlineInitResult, String> {
+        let default_fast: &[u8] = &[0xC1, 0x33, 0xF1, 0x81, 0x66];
+        let default_slow: &[u8] = &[0x33];
+
+        match mode {
+            "fast" => {
+                let data = fast_init_data.unwrap_or(default_fast);
+                let resp = self.fast_init(data)?;
+                Ok(KlineInitResult {
+                    init_method: "fast".into(),
+                    detected_protocol: "iso14230-fast".into(),
+                    keyword_bytes: Vec::new(),
+                    cc_received: false,
+                    init_response: vec![resp],
+                })
+            }
+            "slow" => {
+                let addr = five_baud_address.unwrap_or(default_slow);
+                self.kline_slow_init_with_cc(addr, cc_timeout_ms)
+            }
+            "auto" => {
+                let fast_data = fast_init_data.unwrap_or(default_fast);
+                match self.fast_init(fast_data) {
+                    Ok(resp) => Ok(KlineInitResult {
+                        init_method: "fast".into(),
+                        detected_protocol: "iso14230-fast".into(),
+                        keyword_bytes: Vec::new(),
+                        cc_received: false,
+                        init_response: vec![resp],
+                    }),
+                    Err(fast_err) => {
+                        eprintln!("[j2534] kline_init auto: fast init failed: {fast_err}");
+                        let addr = five_baud_address.unwrap_or(default_slow);
+                        self.kline_slow_init_with_cc(addr, cc_timeout_ms)
+                    }
+                }
+            }
+            other => Err(format!("Unknown kline init mode: {other}")),
+        }
+    }
+
+    /// Five-baud init followed by immediate CC polling (no IPC round-trips).
+    fn kline_slow_init_with_cc(
+        &self,
+        address: &[u8],
+        cc_timeout_ms: u32,
+    ) -> Result<KlineInitResult, String> {
+        let init_resp = self.five_baud_init(address)?;
+
+        // Classify keyword bytes
+        let keyword_bytes = init_resp.data.clone();
+        let detected_protocol = if keyword_bytes.len() >= 2 {
+            let (k1, k2) = (keyword_bytes[0], keyword_bytes[1]);
+            if (k1 == 0x08 && k2 == 0x08) || (k1 == 0x94 && k2 == 0x94) {
+                "iso9141"
+            } else {
+                "iso14230-slow"
+            }
+        } else {
+            "unknown"
+        };
+
+        // Poll for CC — tight loop, no IPC, directly against the DLL
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(cc_timeout_ms as u64);
+        let mut cc_received = false;
+        let mut extra_frames: Vec<CANMessage> = Vec::new();
+
+        while std::time::Instant::now() < deadline {
+            match self.read_messages_drain(50, 16, 1) {
+                Ok(msgs) => {
+                    for msg in msgs {
+                        if msg.data.contains(&0xCC) {
+                            cc_received = true;
+                        }
+                        extra_frames.push(msg);
+                    }
+                    if cc_received {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        eprintln!(
+            "[j2534] kline_slow_init_with_cc: protocol={} cc={} extra_frames={}",
+            detected_protocol, cc_received, extra_frames.len()
+        );
+
+        let mut init_response = vec![init_resp];
+        init_response.extend(extra_frames);
+
+        Ok(KlineInitResult {
+            init_method: "slow".into(),
+            detected_protocol: detected_protocol.into(),
+            keyword_bytes,
+            cc_received,
+            init_response,
+        })
+    }
+
+    pub fn five_baud_init(&self, data: &[u8]) -> Result<CANMessage, String> {
+        let mut input_bytes = data.to_vec();
+        let mut input = SByteArray {
+            num_of_bytes: input_bytes.len() as u32,
+            byte_ptr: input_bytes.as_mut_ptr(),
+        };
+        let mut output_bytes = [0u8; 16];
+        let mut output = SByteArray {
+            num_of_bytes: output_bytes.len() as u32,
+            byte_ptr: output_bytes.as_mut_ptr(),
+        };
+
+        unsafe {
+            let ioctl_fn: Symbol<PassThruIoctlFn> = self
+                .library
+                .get(b"PassThruIoctl\0")
+                .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruIoctl - {}", e))?;
+
+            let result = ioctl_fn(
+                self.channel_id,
+                FIVE_BAUD_INIT,
+                &mut input as *mut SByteArray as *mut c_void,
+                &mut output as *mut SByteArray as *mut c_void,
+            );
+
+            if result != STATUS_NOERROR {
+                let last_error = get_last_error_message(&self.library);
+                return Err(format!(
+                    "ERR_J2534_FIVE_BAUD_INIT_FAILED: error code {} ({}){}",
+                    result,
+                    error_code_to_string(result),
+                    last_error
+                        .map(|s| format!(" - {}", s))
+                        .unwrap_or_default()
+                ));
+            }
+        }
+
+        let len = (output.num_of_bytes as usize).min(output_bytes.len());
+        Ok(CANMessage {
+            timestamp_us: 0,
+            arb_id: 0,
+            extended: false,
+            data: output_bytes[..len].to_vec(),
+            raw_arb_id: 0,
+            rx_status: 0,
+            data_size: len as u32,
+            protocol_id: self.protocol_id,
+        })
     }
 }
 

@@ -8,7 +8,7 @@ fn main() {
 mod app {
     use clap::{Parser, ValueEnum};
     use j2534_bridge::client::BridgeClient;
-    use j2534_bridge::protocol::{CanMessage, DeviceInfo, RawIoResult};
+    use j2534_bridge::protocol::{CanMessage, DeviceInfo, KlineInitMode as ProtoKlineInitMode, RawIoResult};
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,6 +20,12 @@ mod app {
     const CAN_29BIT_ID: u32 = 0x100;
     const CAN_ID_BOTH: u32 = 0x800;
     const CAN_MIXED_CAPTURE_FLAGS: u32 = CAN_ID_BOTH | CAN_29BIT_ID;
+    const ISO9141_NO_CHECKSUM: u32 = 0x200;
+    const ISO9141_K_LINE_ONLY: u32 = 0x1000;
+    const PROTOCOL_ISO9141: u32 = 3;
+    const PROTOCOL_ISO14230: u32 = 4;
+    const PROTOCOL_CAN: u32 = 5;
+    const PROTOCOL_ISO15765: u32 = 6;
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
     enum ConnectMode {
@@ -45,6 +51,14 @@ mod app {
         None,
     }
 
+    #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+    enum KlineInitMode {
+        None,
+        Fast,
+        Slow,
+        Auto,
+    }
+
     #[derive(Parser, Debug)]
     #[command(name = "j2534-dump")]
     #[command(about = "Exercise J2534 bridge open/filter/config parameters and dump traffic in a candump-style text format")]
@@ -63,6 +77,45 @@ mod app {
 
         #[arg(long, default_value_t = 5, help = "J2534 ProtocolID to open, e.g. 5=CAN, 6=ISO15765")]
         protocol_id: u32,
+
+        #[arg(long, value_enum, help = "K-Line init mode: none, fast, slow, auto. Defaults to fast for ISO14230 and slow for ISO9141.")]
+        kline_init_mode: Option<KlineInitMode>,
+
+        #[arg(long, help = "Run FAST_INIT after connect with the given hex bytes. For ISO14230, defaults to C133F18166 if omitted.")]
+        fast_init: Option<String>,
+
+        #[arg(long, help = "Run FIVE_BAUD_INIT after connect with the given hex bytes. For ISO9141, defaults to 33 if omitted.")]
+        five_baud_init: Option<String>,
+
+        #[arg(long, help = "Send a post-init K-Line request payload as hex bytes, e.g. 3E or 1081. The tool wraps it using protocol-appropriate framing.")]
+        kline_request: Option<String>,
+
+        #[arg(long, default_value_t = 1000, help = "Quiet period after K-Line init before sending the first post-init request/keepalive")]
+        kline_post_init_idle_ms: u64,
+
+        #[arg(long, default_value_t = 0, help = "Drain K-Line RX for this many milliseconds immediately after init, before the first post-init request")]
+        kline_post_init_drain_ms: u32,
+
+        #[arg(long, default_value = "0x33", help = "KWP target/arbitration address")]
+        kline_target: String,
+
+        #[arg(long, default_value = "0xF1", help = "Tester/source address")]
+        kline_source: String,
+
+        #[arg(long, default_value = "0x68", help = "ISO9141 target address")]
+        kline_iso_target: String,
+
+        #[arg(long, default_value = "0x6A", help = "ISO9141 source address")]
+        kline_iso_source: String,
+
+        #[arg(long, default_value = "0xF1", help = "ISO9141 tester address")]
+        kline_iso_tester: String,
+
+        #[arg(long, default_value_t = 500, help = "Read timeout after post-init K-Line request")]
+        kline_request_timeout_ms: u32,
+
+        #[arg(long, default_value_t = 0, help = "Send TesterPresent (3E) every N ms during capture to keep the K-Line session alive. 0 = disabled.")]
+        kline_keepalive_ms: u64,
 
         #[arg(long, default_value_t = 500_000)]
         baud_rate: u32,
@@ -198,6 +251,8 @@ mod app {
             bridge.set_loopback(enabled)?;
         }
 
+        run_kline_init(&mut bridge, &cli)?;
+
         for spec in &cli.set_configs {
             let (parameter, value) = parse_key_value_pair(spec)?;
             bridge.set_config(parameter, value)?;
@@ -247,6 +302,7 @@ mod app {
             );
         }
 
+        run_post_init_kline_request(&mut bridge, &cli)?;
         capture_loop(&mut bridge, &cli)
     }
 
@@ -258,6 +314,212 @@ mod app {
         })
         .map_err(|e| format!("Failed to install Ctrl+C handler: {e}"))?;
         Ok(running)
+    }
+
+    fn run_kline_init(bridge: &mut BridgeClient, cli: &Cli) -> Result<(), String> {
+        let mode = match cli.kline_init_mode {
+            Some(mode) => mode,
+            None => default_kline_init_mode(cli.protocol_id),
+        };
+
+        let protocol_mode = match mode {
+            KlineInitMode::None => return Ok(()),
+            KlineInitMode::Fast => ProtoKlineInitMode::Fast,
+            KlineInitMode::Slow => ProtoKlineInitMode::Slow,
+            KlineInitMode::Auto => ProtoKlineInitMode::Auto,
+        };
+
+        let fast_data = cli
+            .fast_init
+            .as_ref()
+            .map(|s| parse_hex_bytes(s))
+            .transpose()?;
+        let slow_addr = cli
+            .five_baud_init
+            .as_ref()
+            .map(|s| parse_hex_bytes(s))
+            .transpose()?;
+
+        eprintln!(
+            "[j2534-dump] K-Line init mode={:?}",
+            protocol_mode
+        );
+
+        let result = bridge.kline_init(protocol_mode, fast_data, slow_addr, Some(300))?;
+
+        eprintln!(
+            "[j2534-dump] K-Line init done: method={} protocol={} cc={} keywords={} frames={}",
+            result.init_method,
+            result.detected_protocol,
+            result.cc_received,
+            format_bytes_spaced(&result.keyword_bytes),
+            result.init_response.len(),
+        );
+
+        if !result.cc_received && result.init_method == "slow" {
+            eprintln!(
+                "[j2534-dump] WARNING: no CC acknowledgment — session may not be established"
+            );
+        }
+
+        for msg in &result.init_response {
+            println!(
+                "{}",
+                format_candump_line(
+                    msg,
+                    &cli.interface,
+                    cli.timestamp,
+                    cli.ascii,
+                    Instant::now(),
+                    0,
+                    0,
+                    cli.raw_details,
+                )
+            );
+        }
+
+        Ok(())
+    }
+
+    fn default_kline_init_mode(protocol_id: u32) -> KlineInitMode {
+        match protocol_id {
+            PROTOCOL_ISO14230 => KlineInitMode::Fast,
+            PROTOCOL_ISO9141 => KlineInitMode::Slow,
+            _ => KlineInitMode::None,
+        }
+    }
+
+    fn run_post_init_kline_request(bridge: &mut BridgeClient, cli: &Cli) -> Result<(), String> {
+        if cli.protocol_id != PROTOCOL_ISO9141 && cli.protocol_id != PROTOCOL_ISO14230 {
+            return Ok(());
+        }
+
+        if cli.kline_post_init_drain_ms > 0 {
+            eprintln!(
+                "[j2534-dump] draining K-Line RX for {} ms immediately after init",
+                cli.kline_post_init_drain_ms
+            );
+            let drained = bridge.read_messages_drain(
+                cli.kline_post_init_drain_ms,
+                cli.batch_size,
+                cli.max_drain_reads,
+            )?;
+            if drained.is_empty() {
+                eprintln!("[j2534-dump] no immediate post-init RX frames");
+            } else {
+                eprintln!("[j2534-dump] immediate post-init RX frames={}", drained.len());
+                for msg in &drained {
+                    println!(
+                        "{}",
+                        format_candump_line(
+                            msg,
+                            &cli.interface,
+                            cli.timestamp,
+                            cli.ascii,
+                            Instant::now(),
+                            0,
+                            0,
+                            cli.raw_details,
+                        )
+                    );
+                }
+            }
+        }
+
+        let Some(request_hex) = &cli.kline_request else {
+            return Ok(());
+        };
+
+        if cli.kline_post_init_idle_ms > 0 {
+            eprintln!(
+                "[j2534-dump] waiting {} ms after init before first K-Line request",
+                cli.kline_post_init_idle_ms
+            );
+            std::thread::sleep(Duration::from_millis(cli.kline_post_init_idle_ms));
+        }
+
+        let payload = parse_hex_bytes(request_hex)?;
+        let target = parse_u32(&cli.kline_target)? as u8;
+        let source = parse_u32(&cli.kline_source)? as u8;
+        let iso_target = parse_u32(&cli.kline_iso_target)? as u8;
+        let iso_source = parse_u32(&cli.kline_iso_source)? as u8;
+        let iso_tester = parse_u32(&cli.kline_iso_tester)? as u8;
+
+        let frame = build_kline_frame(
+            cli.protocol_id,
+            &payload,
+            target,
+            source,
+            iso_target,
+            iso_source,
+            iso_tester,
+        )?;
+
+        eprintln!(
+            "[j2534-dump] K-Line TX payload={} framed={}",
+            format_bytes_spaced(&payload),
+            format_bytes_spaced(&frame)
+        );
+
+        bridge.send_message(0, &frame, false)?;
+
+        let responses = bridge.read_messages_drain(cli.kline_request_timeout_ms, cli.batch_size, cli.max_drain_reads)?;
+        if responses.is_empty() {
+            eprintln!("[j2534-dump] no post-init response within {} ms", cli.kline_request_timeout_ms);
+        } else {
+            eprintln!("[j2534-dump] post-init responses={}", responses.len());
+            for msg in &responses {
+                println!(
+                    "{}",
+                    format_candump_line(
+                        msg,
+                        &cli.interface,
+                        cli.timestamp,
+                        cli.ascii,
+                        Instant::now(),
+                        0,
+                        0,
+                        cli.raw_details,
+                    )
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn build_kline_frame(
+        protocol_id: u32,
+        payload: &[u8],
+        target: u8,
+        source: u8,
+        iso_target: u8,
+        iso_source: u8,
+        iso_tester: u8,
+    ) -> Result<Vec<u8>, String> {
+        let mut frame = Vec::with_capacity(payload.len() + 6);
+        if protocol_id == PROTOCOL_ISO9141 {
+            frame.push(iso_target);
+            frame.push(iso_source);
+            frame.push(iso_tester);
+            frame.extend_from_slice(payload);
+        } else if protocol_id == PROTOCOL_ISO14230 {
+            if payload.len() > 0x0F {
+                return Err("KWP payload too long for short-header framing".to_string());
+            }
+            frame.push(0xC0 | (payload.len() as u8 & 0x0F));
+            frame.push(target);
+            frame.push(source);
+            frame.extend_from_slice(payload);
+        } else {
+            return Err("K-Line framing requested for non-K-Line protocol".to_string());
+        }
+        // Append checksum (sum of all bytes mod 256).
+        // Required when ISO9141_NO_CHECKSUM connect flag is used, since the
+        // driver won't add it for us.
+        let checksum = frame.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+        frame.push(checksum);
+        Ok(frame)
     }
 
     fn capture_loop(bridge: &mut BridgeClient, cli: &Cli) -> Result<(), String> {
@@ -273,6 +535,39 @@ mod app {
             .map(Duration::from_secs_f64);
         let mut captured = 0u64;
 
+        // K-Line keepalive: build TesterPresent frame once
+        let keepalive_interval = if cli.kline_keepalive_ms > 0 {
+            Some(Duration::from_millis(cli.kline_keepalive_ms))
+        } else {
+            None
+        };
+        let keepalive_frame = if keepalive_interval.is_some()
+            && (cli.protocol_id == PROTOCOL_ISO9141 || cli.protocol_id == PROTOCOL_ISO14230)
+        {
+            let target = parse_u32(&cli.kline_target).unwrap_or(0x33) as u8;
+            let source = parse_u32(&cli.kline_source).unwrap_or(0xF1) as u8;
+            let iso_target = parse_u32(&cli.kline_iso_target).unwrap_or(0x68) as u8;
+            let iso_source = parse_u32(&cli.kline_iso_source).unwrap_or(0x6A) as u8;
+            let iso_tester = parse_u32(&cli.kline_iso_tester).unwrap_or(0xF1) as u8;
+            build_kline_frame(
+                cli.protocol_id,
+                &[0x3E], // TesterPresent
+                target, source, iso_target, iso_source, iso_tester,
+            )
+            .ok()
+        } else {
+            None
+        };
+        let mut last_keepalive = Instant::now();
+
+        if let (Some(interval), Some(frame)) = (keepalive_interval, &keepalive_frame) {
+            eprintln!(
+                "[j2534-dump] K-Line keepalive every {}ms: {}",
+                interval.as_millis(),
+                format_bytes_spaced(frame),
+            );
+        }
+
         while running.load(Ordering::SeqCst) {
             if let Some(limit) = duration_limit {
                 if start_monotonic.elapsed() >= limit {
@@ -282,6 +577,14 @@ mod app {
             if let Some(limit) = cli.max_messages {
                 if captured >= limit {
                     break;
+                }
+            }
+
+            // Send keepalive if interval elapsed
+            if let (Some(interval), Some(frame)) = (keepalive_interval, &keepalive_frame) {
+                if last_keepalive.elapsed() >= interval {
+                    bridge.send_message(0, frame, false)?;
+                    last_keepalive = Instant::now();
                 }
             }
 
@@ -659,6 +962,12 @@ mod app {
         if let Some(raw) = &cli.connect_flags {
             return parse_u32(raw);
         }
+        if cli.protocol_id == PROTOCOL_ISO9141 || cli.protocol_id == PROTOCOL_ISO14230 {
+            // All known working implementations use ISO9141_NO_CHECKSUM (0x200) or
+            // plain 0.  ISO9141_K_LINE_ONLY (0x1000) is a J2534-2 extension that
+            // many drivers don't handle correctly.
+            return Ok(ISO9141_NO_CHECKSUM);
+        }
         Ok(match cli.connect_mode {
             ConnectMode::Standard => 0,
             ConnectMode::Extended => CAN_29BIT_ID,
@@ -748,6 +1057,14 @@ mod app {
 
     fn format_bytes_compact(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02X}")).collect()
+    }
+
+    fn format_bytes_spaced(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     fn filter_type_name(filter_type: u32) -> &'static str {
