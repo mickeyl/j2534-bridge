@@ -11,11 +11,9 @@
 
 mod j2534;
 mod protocol;
+mod worker;
 
-use protocol::{
-    CanMessage, DeviceInfo, KlineInitResult, Message, RawIoResult, Request, Response, ResponseData,
-    VersionInfo,
-};
+use protocol::{DeviceInfo, Message, Request, Response, ResponseData};
 use std::io::{BufRead, BufReader, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -64,28 +62,25 @@ fn run_bridge(pipe_name: &str) -> Result<(), Box<dyn std::error::Error>> {
         ConnectNamedPipe, CreateNamedPipeA, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
     };
 
-    // Create the named pipe
     let pipe_name_cstr = std::ffi::CString::new(pipe_name)?;
     let pipe_handle = unsafe {
         CreateNamedPipeA(
             PCSTR::from_raw(pipe_name_cstr.as_ptr() as *const u8),
             PIPE_ACCESS_DUPLEX,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-            1,     // max instances
-            65536, // out buffer size (increased for high-throughput frame batches)
-            65536, // in buffer size
-            0,     // default timeout
-            None,  // default security
+            1,
+            65536,
+            65536,
+            0,
+            None,
         )
     }?;
 
     eprintln!("[bridge] Waiting for client connection...");
 
-    // Wait for client to connect
     let connect_result = unsafe { ConnectNamedPipe(pipe_handle, None) };
     if connect_result.is_err() {
         let err = std::io::Error::last_os_error();
-        // ERROR_PIPE_CONNECTED (535) means client connected before we called ConnectNamedPipe
         if err.raw_os_error() != Some(535) {
             let _ = unsafe { CloseHandle(pipe_handle) };
             return Err(format!("Failed to connect pipe: {}", err).into());
@@ -94,16 +89,10 @@ fn run_bridge(pipe_name: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("[bridge] Client connected");
 
-    // Convert to std File for easier I/O
     let handle_raw = pipe_handle.0 as *mut std::ffi::c_void;
     let file = unsafe { std::fs::File::from_raw_handle(handle_raw) };
 
-    // Run the message loop
-    let result = message_loop(file);
-
-    // Note: file is dropped here, which closes the handle
-
-    result
+    message_loop(file)
 }
 
 #[cfg(not(windows))]
@@ -115,13 +104,13 @@ fn message_loop(pipe: std::fs::File) -> Result<(), Box<dyn std::error::Error>> {
     let reader = BufReader::new(pipe.try_clone()?);
     let mut writer = pipe;
 
-    let connection: Arc<Mutex<Option<j2534::J2534Connection>>> = Arc::new(Mutex::new(None));
+    let connection: Arc<Mutex<Option<worker::BridgeWorker>>> = Arc::new(Mutex::new(None));
 
     for line in reader.lines() {
         let line = match line {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("[bridge] Read error: {}", e);
+            Ok(line) => line,
+            Err(err) => {
+                eprintln!("[bridge] Read error: {}", err);
                 break;
             }
         };
@@ -130,14 +119,13 @@ fn message_loop(pipe: std::fs::File) -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        // Parse the request
         let msg: Message<Request> = match serde_json::from_str(&line) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("[bridge] Parse error: {}", e);
+            Ok(message) => message,
+            Err(err) => {
+                eprintln!("[bridge] Parse error: {}", err);
                 let response = Message {
                     id: 0,
-                    payload: Response::error(-1, format!("Parse error: {}", e)),
+                    payload: Response::error(-1, format!("Parse error: {}", err)),
                 };
                 send_response(&mut writer, &response)?;
                 continue;
@@ -148,11 +136,10 @@ fn message_loop(pipe: std::fs::File) -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("[bridge] Request {}: {:?}", msg.id, msg.payload);
         }
 
-        // Handle the request with panic catching to prevent silent bridge death
         let response_payload = {
-            let conn = Arc::clone(&connection);
+            let worker = Arc::clone(&connection);
             let request = msg.payload.clone();
-            match panic::catch_unwind(AssertUnwindSafe(|| handle_request(&request, &conn))) {
+            match panic::catch_unwind(AssertUnwindSafe(|| handle_request(&request, &worker))) {
                 Ok(response) => response,
                 Err(panic_info) => {
                     let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
@@ -175,10 +162,15 @@ fn message_loop(pipe: std::fs::File) -> Result<(), Box<dyn std::error::Error>> {
 
         send_response(&mut writer, &response)?;
 
-        // Check for shutdown
         if matches!(msg.payload, Request::Shutdown) {
             eprintln!("[bridge] Shutdown requested");
             break;
+        }
+    }
+
+    if let Ok(mut worker_guard) = connection.lock() {
+        if let Some(mut worker) = worker_guard.take() {
+            worker.join();
         }
     }
 
@@ -198,7 +190,7 @@ fn send_response(
 
 fn handle_request(
     request: &Request,
-    connection: &Arc<Mutex<Option<j2534::J2534Connection>>>,
+    connection: &Arc<Mutex<Option<worker::BridgeWorker>>>,
 ) -> Response {
     match request {
         Request::EnumerateDevices => {
@@ -224,477 +216,83 @@ fn handle_request(
             baud_rate,
             connect_flags,
         } => {
-            let mut conn_guard = connection.lock().unwrap();
-            if conn_guard.is_some() {
+            let mut worker_guard = connection.lock().unwrap();
+            if worker_guard.is_some() {
                 return Response::error(-1, "Already connected");
             }
 
-            match j2534::J2534Connection::open(
-                dll_path,
+            match worker::BridgeWorker::spawn(
+                dll_path.clone(),
                 *protocol_id,
                 *baud_rate,
                 *connect_flags,
-                |_| {},
             ) {
-                Ok(conn) => {
-                    *conn_guard = Some(conn);
+                Ok(worker) => {
+                    *worker_guard = Some(worker);
                     Response::ok(ResponseData::Connected)
                 }
-                Err(e) => Response::error(-1, e),
+                Err(err) => Response::error(-1, err),
             }
         }
 
         Request::Close => {
-            let mut conn_guard = connection.lock().unwrap();
-            *conn_guard = None;
-            Response::ok_none()
+            let mut worker_guard = connection.lock().unwrap();
+            close_active_worker(&mut worker_guard)
         }
 
-        Request::SendMessage {
-            arb_id,
-            data,
-            extended,
-        } => {
-            let conn_guard = connection.lock().unwrap();
-            match conn_guard.as_ref() {
-                Some(conn) => match conn.send_message(*arb_id, data, *extended) {
-                    Ok(()) => Response::ok_none(),
-                    Err(e) => Response::error(-1, e),
-                },
-                None => Response::error(-1, "Not connected"),
+        Request::Shutdown => {
+            let mut worker_guard = connection.lock().unwrap();
+            shutdown_active_worker(&mut worker_guard)
+        }
+
+        _ => {
+            let mut worker_guard = connection.lock().unwrap();
+            forward_active_worker_request(&mut worker_guard, request.clone())
+        }
+    }
+}
+
+fn close_active_worker(worker: &mut Option<worker::BridgeWorker>) -> Response {
+    match worker.take() {
+        Some(mut active_worker) => {
+            let response = active_worker
+                .request(Request::Close)
+                .unwrap_or_else(|err| Response::error(-1, err));
+            active_worker.join();
+            response
+        }
+        None => Response::ok_none(),
+    }
+}
+
+fn shutdown_active_worker(worker: &mut Option<worker::BridgeWorker>) -> Response {
+    match worker.take() {
+        Some(mut active_worker) => {
+            let response = active_worker
+                .request(Request::Shutdown)
+                .unwrap_or_else(|err| Response::error(-1, err));
+            active_worker.join();
+            response
+        }
+        None => Response::ok_none(),
+    }
+}
+
+fn forward_active_worker_request(
+    worker: &mut Option<worker::BridgeWorker>,
+    request: Request,
+) -> Response {
+    let Some(active_worker) = worker.as_mut() else {
+        return Response::error(-1, "Not connected");
+    };
+
+    match active_worker.request(request) {
+        Ok(response) => response,
+        Err(err) => {
+            if let Some(mut dead_worker) = worker.take() {
+                dead_worker.join();
             }
+            Response::error(-1, err)
         }
-
-        Request::SendMessagesBatch { messages } => {
-            let conn_guard = connection.lock().unwrap();
-            match conn_guard.as_ref() {
-                Some(conn) => {
-                    let msg_tuples: Vec<(u32, Vec<u8>, bool)> = messages
-                        .iter()
-                        .map(|m| (m.arb_id, m.data.clone(), m.extended))
-                        .collect();
-                    match conn.send_messages_batch(&msg_tuples) {
-                        Ok(num_sent) => Response::ok(ResponseData::Number(num_sent)),
-                        Err(e) => Response::error(-1, e),
-                    }
-                }
-                None => Response::error(-1, "Not connected"),
-            }
-        }
-
-        Request::WriteMessagesRaw {
-            messages,
-            timeout_ms,
-        } => {
-            let conn_guard = connection.lock().unwrap();
-            match conn_guard.as_ref() {
-                Some(conn) => {
-                    let msg_tuples: Vec<(u32, Vec<u8>, bool)> = messages
-                        .iter()
-                        .map(|m| (m.arb_id, m.data.clone(), m.extended))
-                        .collect();
-                    match conn.write_messages_raw(&msg_tuples, *timeout_ms) {
-                        Ok(raw) => Response::ok(ResponseData::RawIo(RawIoResult {
-                            result: raw.result,
-                            num_msgs: raw.num_msgs,
-                        })),
-                        Err(e) => Response::error(-1, e),
-                    }
-                }
-                None => Response::error(-1, "Not connected"),
-            }
-        }
-
-        Request::ReadMessages {
-            timeout_ms,
-            batch_size,
-            max_drain_reads,
-        } => {
-            let conn_guard = connection.lock().unwrap();
-            match conn_guard.as_ref() {
-                Some(conn) => {
-                    match conn.read_messages_drain(*timeout_ms, *batch_size, *max_drain_reads) {
-                        Ok(messages) => {
-                            let can_messages: Vec<CanMessage> = messages
-                                .into_iter()
-                                .map(|m| CanMessage {
-                                    timestamp_us: m.timestamp_us,
-                                    arb_id: m.arb_id,
-                                    extended: m.extended,
-                                    data: m.data,
-                                    raw_arb_id: m.raw_arb_id,
-                                    rx_status: m.rx_status,
-                                    data_size: m.data_size,
-                                    protocol_id: m.protocol_id,
-                                })
-                                .collect();
-                            Response::ok(ResponseData::Messages(can_messages))
-                        }
-                        Err(e) => Response::error(-1, e),
-                    }
-                }
-                None => Response::error(-1, "Not connected"),
-            }
-        }
-
-        Request::ReadMessagesWithLoopback { timeout_ms } => {
-            let conn_guard = connection.lock().unwrap();
-            match conn_guard.as_ref() {
-                Some(conn) => match conn.read_messages_with_loopback(*timeout_ms) {
-                    Ok(messages) => {
-                        let can_messages: Vec<CanMessage> = messages
-                            .into_iter()
-                            .map(|m| CanMessage {
-                                timestamp_us: m.timestamp_us,
-                                arb_id: m.arb_id,
-                                extended: m.extended,
-                                data: m.data,
-                                raw_arb_id: m.raw_arb_id,
-                                rx_status: m.rx_status,
-                                data_size: m.data_size,
-                                protocol_id: m.protocol_id,
-                            })
-                            .collect();
-                        Response::ok(ResponseData::Messages(can_messages))
-                    }
-                    Err(e) => Response::error(-1, e),
-                },
-                None => Response::error(-1, "Not connected"),
-            }
-        }
-
-        Request::ReadMessagesRaw {
-            timeout_ms,
-            max_msgs,
-        } => {
-            let conn_guard = connection.lock().unwrap();
-            match conn_guard.as_ref() {
-                Some(conn) => match conn.read_messages_raw(*timeout_ms, *max_msgs) {
-                    Ok(raw) => Response::ok(ResponseData::RawIo(RawIoResult {
-                        result: raw.result,
-                        num_msgs: raw.num_msgs,
-                    })),
-                    Err(e) => Response::error(-1, e),
-                },
-                None => Response::error(-1, "Not connected"),
-            }
-        }
-
-        Request::ClearBuffers => {
-            let conn_guard = connection.lock().unwrap();
-            match conn_guard.as_ref() {
-                Some(conn) => match conn.clear_buffers() {
-                    Ok(()) => Response::ok_none(),
-                    Err(e) => Response::error(-1, e),
-                },
-                None => Response::error(-1, "Not connected"),
-            }
-        }
-
-        Request::ReadVersion => {
-            let conn_guard = connection.lock().unwrap();
-            match conn_guard.as_ref() {
-                Some(conn) => match conn.read_version() {
-                    Ok(v) => Response::ok(ResponseData::Version(VersionInfo {
-                        firmware_version: v.firmware_version,
-                        dll_version: v.dll_version,
-                        api_version: v.api_version,
-                    })),
-                    Err(e) => Response::error(-1, e),
-                },
-                None => Response::error(-1, "Not connected"),
-            }
-        }
-
-        Request::GetLastError => {
-            let conn_guard = connection.lock().unwrap();
-            match conn_guard.as_ref() {
-                Some(conn) => match conn.get_last_error() {
-                    Ok(s) => Response::ok(ResponseData::String(s)),
-                    Err(e) => Response::error(-1, e),
-                },
-                None => Response::error(-1, "Not connected"),
-            }
-        }
-
-        Request::ReadBatteryVoltage => {
-            let conn_guard = connection.lock().unwrap();
-            match conn_guard.as_ref() {
-                Some(conn) => match conn.read_battery_voltage() {
-                    Ok(v) => Response::ok(ResponseData::Float(v)),
-                    Err(e) => Response::error(-1, e),
-                },
-                None => Response::error(-1, "Not connected"),
-            }
-        }
-
-        Request::ReadProgrammingVoltage => {
-            let conn_guard = connection.lock().unwrap();
-            match conn_guard.as_ref() {
-                Some(conn) => match conn.read_programming_voltage() {
-                    Ok(v) => Response::ok(ResponseData::Float(v)),
-                    Err(e) => Response::error(-1, e),
-                },
-                None => Response::error(-1, "Not connected"),
-            }
-        }
-
-        Request::FastInit { data } => {
-            let conn_guard = connection.lock().unwrap();
-            match conn_guard.as_ref() {
-                Some(conn) => match conn.fast_init(data) {
-                    Ok(msg) => Response::ok(ResponseData::Messages(vec![CanMessage {
-                        timestamp_us: msg.timestamp_us,
-                        arb_id: msg.arb_id,
-                        extended: msg.extended,
-                        data: msg.data,
-                        raw_arb_id: msg.raw_arb_id,
-                        rx_status: msg.rx_status,
-                        data_size: msg.data_size,
-                        protocol_id: msg.protocol_id,
-                    }])),
-                    Err(e) => Response::error(-1, e),
-                },
-                None => Response::error(-1, "Not connected"),
-            }
-        }
-
-        Request::FiveBaudInit { data } => {
-            let conn_guard = connection.lock().unwrap();
-            match conn_guard.as_ref() {
-                Some(conn) => match conn.five_baud_init(data) {
-                    Ok(msg) => Response::ok(ResponseData::Messages(vec![CanMessage {
-                        timestamp_us: msg.timestamp_us,
-                        arb_id: msg.arb_id,
-                        extended: msg.extended,
-                        data: msg.data,
-                        raw_arb_id: msg.raw_arb_id,
-                        rx_status: msg.rx_status,
-                        data_size: msg.data_size,
-                        protocol_id: msg.protocol_id,
-                    }])),
-                    Err(e) => Response::error(-1, e),
-                },
-                None => Response::error(-1, "Not connected"),
-            }
-        }
-
-        Request::KlineInit {
-            init_mode,
-            fast_init_data,
-            five_baud_address,
-            cc_timeout_ms,
-        } => {
-            let conn_guard = connection.lock().unwrap();
-            match conn_guard.as_ref() {
-                Some(conn) => {
-                    let mode_str = match init_mode {
-                        protocol::KlineInitMode::Fast => "fast",
-                        protocol::KlineInitMode::Slow => "slow",
-                        protocol::KlineInitMode::Auto => "auto",
-                    };
-                    let cc_ms = cc_timeout_ms.unwrap_or(300);
-                    match conn.kline_init(
-                        mode_str,
-                        fast_init_data.as_deref(),
-                        five_baud_address.as_deref(),
-                        cc_ms,
-                    ) {
-                        Ok(result) => {
-                            let msgs: Vec<CanMessage> = result
-                                .init_response
-                                .into_iter()
-                                .map(|m| CanMessage {
-                                    timestamp_us: m.timestamp_us,
-                                    arb_id: m.arb_id,
-                                    extended: m.extended,
-                                    data: m.data,
-                                    raw_arb_id: m.raw_arb_id,
-                                    rx_status: m.rx_status,
-                                    data_size: m.data_size,
-                                    protocol_id: m.protocol_id,
-                                })
-                                .collect();
-                            Response::ok(ResponseData::KlineInit(KlineInitResult {
-                                init_method: result.init_method,
-                                detected_protocol: result.detected_protocol,
-                                keyword_bytes: result.keyword_bytes,
-                                cc_received: result.cc_received,
-                                init_response: msgs,
-                            }))
-                        }
-                        Err(e) => Response::error(-1, e),
-                    }
-                }
-                None => Response::error(-1, "Not connected"),
-            }
-        }
-
-        Request::StartPeriodicMessage {
-            arb_id,
-            data,
-            interval_ms,
-            extended,
-        } => {
-            let conn_guard = connection.lock().unwrap();
-            match conn_guard.as_ref() {
-                Some(conn) => {
-                    match conn.start_periodic_message(*arb_id, data, *interval_ms, *extended) {
-                        Ok(id) => Response::ok(ResponseData::Number(id)),
-                        Err(e) => Response::error(-1, e),
-                    }
-                }
-                None => Response::error(-1, "Not connected"),
-            }
-        }
-
-        Request::StopPeriodicMessage { msg_id } => {
-            let conn_guard = connection.lock().unwrap();
-            match conn_guard.as_ref() {
-                Some(conn) => match conn.stop_periodic_message(*msg_id) {
-                    Ok(()) => Response::ok_none(),
-                    Err(e) => Response::error(-1, e),
-                },
-                None => Response::error(-1, "Not connected"),
-            }
-        }
-
-        Request::ClearPeriodicMessages => {
-            let conn_guard = connection.lock().unwrap();
-            match conn_guard.as_ref() {
-                Some(conn) => match conn.clear_periodic_messages() {
-                    Ok(()) => Response::ok_none(),
-                    Err(e) => Response::error(-1, e),
-                },
-                None => Response::error(-1, "Not connected"),
-            }
-        }
-
-        Request::AddFilter {
-            filter_type,
-            mask,
-            pattern,
-            extended,
-        } => {
-            let conn_guard = connection.lock().unwrap();
-            match conn_guard.as_ref() {
-                Some(conn) => {
-                    let ft = match filter_type.as_str() {
-                        "pass" => j2534::PASS_FILTER,
-                        "block" => j2534::BLOCK_FILTER,
-                        "flow_control" => j2534::FLOW_CONTROL_FILTER,
-                        _ => return Response::error(-1, "Invalid filter type"),
-                    };
-                    match conn.add_filter(ft, mask, pattern, *extended) {
-                        Ok(id) => Response::ok(ResponseData::Number(id)),
-                        Err(e) => Response::error(-1, e),
-                    }
-                }
-                None => Response::error(-1, "Not connected"),
-            }
-        }
-
-        Request::AddFilterRaw {
-            filter_type,
-            mask,
-            pattern,
-            extended,
-        } => {
-            let conn_guard = connection.lock().unwrap();
-            match conn_guard.as_ref() {
-                Some(conn) => {
-                    let ft = match filter_type.as_str() {
-                        "pass" => j2534::PASS_FILTER,
-                        "block" => j2534::BLOCK_FILTER,
-                        "flow_control" => j2534::FLOW_CONTROL_FILTER,
-                        _ => return Response::error(-1, "Invalid filter type"),
-                    };
-                    match conn.add_filter_raw(ft, mask, pattern, *extended) {
-                        Ok(id) => Response::ok(ResponseData::Number(id)),
-                        Err(e) => Response::error(-1, e),
-                    }
-                }
-                None => Response::error(-1, "Not connected"),
-            }
-        }
-
-        Request::RemoveFilter { filter_id } => {
-            let conn_guard = connection.lock().unwrap();
-            match conn_guard.as_ref() {
-                Some(conn) => match conn.remove_filter(*filter_id) {
-                    Ok(()) => Response::ok_none(),
-                    Err(e) => Response::error(-1, e),
-                },
-                None => Response::error(-1, "Not connected"),
-            }
-        }
-
-        Request::ClearFilters => {
-            let conn_guard = connection.lock().unwrap();
-            match conn_guard.as_ref() {
-                Some(conn) => match conn.clear_filters() {
-                    Ok(()) => Response::ok_none(),
-                    Err(e) => Response::error(-1, e),
-                },
-                None => Response::error(-1, "Not connected"),
-            }
-        }
-
-        Request::GetConfig { parameter } => {
-            let conn_guard = connection.lock().unwrap();
-            match conn_guard.as_ref() {
-                Some(conn) => match conn.get_config(*parameter) {
-                    Ok(v) => Response::ok(ResponseData::Number(v)),
-                    Err(e) => Response::error(-1, e),
-                },
-                None => Response::error(-1, "Not connected"),
-            }
-        }
-
-        Request::SetConfig { parameter, value } => {
-            let conn_guard = connection.lock().unwrap();
-            match conn_guard.as_ref() {
-                Some(conn) => match conn.set_config(*parameter, *value) {
-                    Ok(()) => Response::ok_none(),
-                    Err(e) => Response::error(-1, e),
-                },
-                None => Response::error(-1, "Not connected"),
-            }
-        }
-
-        Request::GetLoopback => {
-            let conn_guard = connection.lock().unwrap();
-            match conn_guard.as_ref() {
-                Some(conn) => match conn.get_loopback() {
-                    Ok(v) => Response::ok(ResponseData::Bool(v)),
-                    Err(e) => Response::error(-1, e),
-                },
-                None => Response::error(-1, "Not connected"),
-            }
-        }
-
-        Request::SetLoopback { enabled } => {
-            let conn_guard = connection.lock().unwrap();
-            match conn_guard.as_ref() {
-                Some(conn) => match conn.set_loopback(*enabled) {
-                    Ok(()) => Response::ok_none(),
-                    Err(e) => Response::error(-1, e),
-                },
-                None => Response::error(-1, "Not connected"),
-            }
-        }
-
-        Request::GetDataRate => {
-            let conn_guard = connection.lock().unwrap();
-            match conn_guard.as_ref() {
-                Some(conn) => match conn.get_data_rate() {
-                    Ok(v) => Response::ok(ResponseData::Number(v)),
-                    Err(e) => Response::error(-1, e),
-                },
-                None => Response::error(-1, "Not connected"),
-            }
-        }
-
-        Request::Shutdown => Response::ok_none(),
     }
 }
