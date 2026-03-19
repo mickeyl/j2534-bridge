@@ -553,6 +553,7 @@ pub fn enumerate_devices() -> Vec<J2534Device> {
     ];
 
     for (path, flags) in &registry_paths {
+        let is_v5_registry = path.contains("05.00");
         if let Ok(passthru_key) = hklm.open_subkey_with_flags(path, *flags) {
             for device_name in passthru_key.enum_keys().filter_map(|k| k.ok()) {
                 if let Ok(device_key) = passthru_key.open_subkey_with_flags(&device_name, *flags) {
@@ -560,8 +561,13 @@ pub fn enumerate_devices() -> Vec<J2534Device> {
                     let vendor: String = device_key.get_value("Vendor").unwrap_or_default();
                     let dll_path: String =
                         device_key.get_value("FunctionLibrary").unwrap_or_default();
-                    let can_iso15765: u32 = device_key.get_value("ISO15765").unwrap_or(0);
-                    let can_iso11898: u32 = device_key.get_value("CAN").unwrap_or(0);
+                    // v5.0 registry entries typically omit CAN/ISO15765 flags;
+                    // default to true since v5.0 devices support CAN by spec
+                    let default_protocol: u32 = if is_v5_registry { 1 } else { 0 };
+                    let can_iso15765: u32 =
+                        device_key.get_value("ISO15765").unwrap_or(default_protocol);
+                    let can_iso11898: u32 =
+                        device_key.get_value("CAN").unwrap_or(default_protocol);
 
                     if dll_path.is_empty() {
                         continue;
@@ -578,7 +584,11 @@ pub fn enumerate_devices() -> Vec<J2534Device> {
                             None => (
                                 false,
                                 Some("DLL not found".to_string()),
-                                "04.04".to_string(),
+                                if is_v5_registry {
+                                    "05.00".to_string()
+                                } else {
+                                    "04.04".to_string()
+                                },
                                 if cfg!(target_pointer_width = "64") { 64 } else { 32 },
                             ),
                             Some(bits) => (
@@ -588,7 +598,13 @@ pub fn enumerate_devices() -> Vec<J2534Device> {
                                 bits,
                             ),
                         };
-                    let clean_name = clean_device_name(&name);
+                    let mut clean_name = clean_device_name(&name);
+                    // Disambiguate v5.0 entries from their v4.04 counterparts
+                    if is_v5_registry
+                        && devices.iter().any(|d: &J2534Device| d.name == clean_name)
+                    {
+                        clean_name = format!("{} (v5.0)", clean_name);
+                    }
 
                     devices.push(J2534Device {
                         name: clean_name,
