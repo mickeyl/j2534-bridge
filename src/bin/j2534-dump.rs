@@ -900,14 +900,27 @@ mod app {
 
     fn print_devices(devices: &[DeviceInfo]) {
         for device in devices {
+            let status = if !device.available {
+                format!(
+                    " [UNAVAILABLE: {}]",
+                    device
+                        .unavailable_reason
+                        .as_deref()
+                        .unwrap_or("unknown reason")
+                )
+            } else {
+                String::new()
+            };
             println!(
-                "{} | vendor={} | bitness={} | path={} | CAN={} | ISO15765={}",
+                "{} | vendor={} | bitness={} | api={} | path={} | CAN={} | ISO15765={}{}",
                 device.name,
                 device.vendor,
                 device.bitness,
+                device.api_version,
                 device.dll_path,
                 device.can_iso11898,
-                device.can_iso15765
+                device.can_iso15765,
+                status
             );
         }
     }
