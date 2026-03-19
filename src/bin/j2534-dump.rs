@@ -911,15 +911,19 @@ mod app {
             } else {
                 String::new()
             };
+            let protocols = if device.supported_protocols.is_empty() {
+                String::from("-")
+            } else {
+                device.supported_protocols.join(", ")
+            };
             println!(
-                "{} | vendor={} | bitness={} | api={} | path={} | CAN={} | ISO15765={}{}",
+                "{} | vendor={} | bitness={} | api={} | protocols=[{}] | path={}{}",
                 device.name,
                 device.vendor,
                 device.bitness,
                 device.api_version,
+                protocols,
                 device.dll_path,
-                device.can_iso11898,
-                device.can_iso15765,
                 status
             );
         }
@@ -942,6 +946,7 @@ mod app {
                 available: true,
                 unavailable_reason: None,
                 api_version: String::new(),
+                supported_protocols: vec![],
             });
         }
 

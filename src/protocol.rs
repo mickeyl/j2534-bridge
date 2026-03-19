@@ -231,6 +231,7 @@ pub struct DeviceInfo {
     pub available: bool,
     pub unavailable_reason: Option<String>,
     pub api_version: String,
+    pub supported_protocols: Vec<String>,
 }
 
 /// CAN / K-Line message
@@ -658,6 +659,7 @@ mod tests {
             available: true,
             unavailable_reason: None,
             api_version: "04.04".to_string(),
+            supported_protocols: vec!["CAN".to_string(), "ISO-TP".to_string()],
         };
         let resp = Response::ok(ResponseData::Devices(vec![device]));
         let json = serde_json::to_string(&resp).unwrap();

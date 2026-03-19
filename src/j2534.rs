@@ -290,6 +290,7 @@ pub struct J2534Device {
     pub available: bool,
     pub unavailable_reason: Option<String>,
     pub api_version: String,
+    pub supported_protocols: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -561,13 +562,36 @@ pub fn enumerate_devices() -> Vec<J2534Device> {
                     let vendor: String = device_key.get_value("Vendor").unwrap_or_default();
                     let dll_path: String =
                         device_key.get_value("FunctionLibrary").unwrap_or_default();
-                    // v5.0 registry entries typically omit CAN/ISO15765 flags;
+                    // v5.0 registry entries typically omit protocol flags;
                     // default to true since v5.0 devices support CAN by spec
                     let default_protocol: u32 = if is_v5_registry { 1 } else { 0 };
                     let can_iso15765: u32 =
                         device_key.get_value("ISO15765").unwrap_or(default_protocol);
                     let can_iso11898: u32 =
                         device_key.get_value("CAN").unwrap_or(default_protocol);
+
+                    // Collect all supported protocols from registry
+                    let mut supported_protocols = Vec::new();
+                    let protocol_keys: &[(&str, &str)] = &[
+                        ("CAN", "CAN"),
+                        ("ISO15765", "ISO-TP"),
+                        ("ISO9141", "ISO 9141"),
+                        ("ISO14230", "ISO 14230"),
+                        ("J1850PWM", "J1850 PWM"),
+                        ("J1850VPW", "J1850 VPW"),
+                        ("CAN_FD_PS", "CAN-FD"),
+                        ("ISO15765_FD_PS", "ISO-TP FD"),
+                        ("SW_CAN_PS", "SW-CAN"),
+                        ("TP2_0_PS", "TP 2.0"),
+                    ];
+                    for &(reg_key, display_name) in protocol_keys {
+                        let val: u32 = device_key.get_value(reg_key).unwrap_or(
+                            if is_v5_registry && (reg_key == "CAN" || reg_key == "ISO15765") { 1 } else { 0 }
+                        );
+                        if val != 0 {
+                            supported_protocols.push(display_name.to_string());
+                        }
+                    }
 
                     if dll_path.is_empty() {
                         continue;
@@ -617,6 +641,7 @@ pub fn enumerate_devices() -> Vec<J2534Device> {
                         available,
                         unavailable_reason,
                         api_version,
+                        supported_protocols,
                     });
                 }
             }

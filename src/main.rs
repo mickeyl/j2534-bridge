@@ -208,6 +208,7 @@ fn handle_request(
                     available: d.available,
                     unavailable_reason: d.unavailable_reason,
                     api_version: d.api_version,
+                    supported_protocols: d.supported_protocols,
                 })
                 .collect();
             Response::ok(ResponseData::Devices(device_infos))
