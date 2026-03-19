@@ -598,3 +598,321 @@ fn read_env_u64(name: &str) -> Option<u64> {
 fn read_env_usize(name: &str) -> Option<usize> {
     std::env::var(name).ok()?.parse().ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_msg(arb_id: u32) -> CanMessage {
+        CanMessage {
+            timestamp_us: 0,
+            arb_id,
+            extended: false,
+            data: vec![],
+            raw_arb_id: arb_id,
+            rx_status: 0,
+            data_size: 0,
+            protocol_id: 5,
+        }
+    }
+
+    fn make_msgs(ids: &[u32]) -> Vec<CanMessage> {
+        ids.iter().map(|&id| make_msg(id)).collect()
+    }
+
+    // --- compute_read_limit ---
+
+    #[test]
+    fn compute_read_limit_defaults() {
+        assert_eq!(compute_read_limit(256, 64), 256 * 64);
+    }
+
+    #[test]
+    fn compute_read_limit_small_values() {
+        assert_eq!(compute_read_limit(1, 1), 1);
+    }
+
+    #[test]
+    fn compute_read_limit_clamps_batch_size_to_max() {
+        // batch_size > MAX_BATCH_SIZE (256) should be clamped
+        assert_eq!(compute_read_limit(1000, 1), MAX_BATCH_SIZE);
+    }
+
+    #[test]
+    fn compute_read_limit_clamps_drain_reads_to_max() {
+        // max_drain_reads > MAX_DRAIN_READS (256) should be clamped
+        assert_eq!(compute_read_limit(1, 1000), MAX_DRAIN_READS);
+    }
+
+    #[test]
+    fn compute_read_limit_clamps_zero_to_one() {
+        // Zero values should be clamped to 1
+        assert_eq!(compute_read_limit(0, 0), 1);
+    }
+
+    // --- parse_filter_type ---
+
+    #[test]
+    fn parse_filter_type_pass() {
+        assert_eq!(parse_filter_type("pass").unwrap(), j2534::PASS_FILTER);
+    }
+
+    #[test]
+    fn parse_filter_type_block() {
+        assert_eq!(parse_filter_type("block").unwrap(), j2534::BLOCK_FILTER);
+    }
+
+    #[test]
+    fn parse_filter_type_flow_control() {
+        assert_eq!(
+            parse_filter_type("flow_control").unwrap(),
+            j2534::FLOW_CONTROL_FILTER
+        );
+    }
+
+    #[test]
+    fn parse_filter_type_invalid() {
+        assert!(parse_filter_type("invalid").is_err());
+        assert!(parse_filter_type("").is_err());
+    }
+
+    // --- push_messages ---
+
+    #[test]
+    fn push_messages_empty_input() {
+        let mut buffer = VecDeque::new();
+        let mut stats = RxBufferStats::default();
+        push_messages(&mut buffer, &mut stats, 10, vec![]);
+        assert!(buffer.is_empty());
+        assert_eq!(stats.dropped_frames, 0);
+        assert_eq!(stats.high_water_mark, 0);
+    }
+
+    #[test]
+    fn push_messages_under_capacity() {
+        let mut buffer = VecDeque::new();
+        let mut stats = RxBufferStats::default();
+        push_messages(&mut buffer, &mut stats, 10, make_msgs(&[0x100, 0x200, 0x300]));
+        assert_eq!(buffer.len(), 3);
+        assert_eq!(stats.dropped_frames, 0);
+        assert_eq!(stats.high_water_mark, 3);
+    }
+
+    #[test]
+    fn push_messages_at_capacity_drops_oldest() {
+        let mut buffer = VecDeque::new();
+        let mut stats = RxBufferStats::default();
+        // Fill to capacity
+        push_messages(&mut buffer, &mut stats, 3, make_msgs(&[0x100, 0x200, 0x300]));
+        assert_eq!(buffer.len(), 3);
+        assert_eq!(stats.dropped_frames, 0);
+
+        // Push one more — should drop 0x100
+        push_messages(&mut buffer, &mut stats, 3, make_msgs(&[0x400]));
+        assert_eq!(buffer.len(), 3);
+        assert_eq!(stats.dropped_frames, 1);
+        assert_eq!(buffer[0].arb_id, 0x200);
+        assert_eq!(buffer[1].arb_id, 0x300);
+        assert_eq!(buffer[2].arb_id, 0x400);
+    }
+
+    #[test]
+    fn push_messages_overflow_burst() {
+        let mut buffer = VecDeque::new();
+        let mut stats = RxBufferStats::default();
+        // Capacity 2, push 5 messages
+        push_messages(
+            &mut buffer,
+            &mut stats,
+            2,
+            make_msgs(&[0x100, 0x200, 0x300, 0x400, 0x500]),
+        );
+        assert_eq!(buffer.len(), 2);
+        assert_eq!(stats.dropped_frames, 3);
+        // Only the last 2 should remain
+        assert_eq!(buffer[0].arb_id, 0x400);
+        assert_eq!(buffer[1].arb_id, 0x500);
+    }
+
+    #[test]
+    fn push_messages_high_water_mark_tracks_peak() {
+        let mut buffer = VecDeque::new();
+        let mut stats = RxBufferStats::default();
+        push_messages(&mut buffer, &mut stats, 100, make_msgs(&[0x100, 0x200, 0x300]));
+        assert_eq!(stats.high_water_mark, 3);
+
+        // Drain some
+        buffer.pop_front();
+        // Push more — high water should update
+        push_messages(&mut buffer, &mut stats, 100, make_msgs(&[0x400, 0x500, 0x600]));
+        assert_eq!(stats.high_water_mark, 5);
+    }
+
+    #[test]
+    fn push_messages_capacity_one() {
+        let mut buffer = VecDeque::new();
+        let mut stats = RxBufferStats::default();
+        push_messages(&mut buffer, &mut stats, 1, make_msgs(&[0x100]));
+        assert_eq!(buffer.len(), 1);
+        assert_eq!(stats.dropped_frames, 0);
+
+        push_messages(&mut buffer, &mut stats, 1, make_msgs(&[0x200]));
+        assert_eq!(buffer.len(), 1);
+        assert_eq!(stats.dropped_frames, 1);
+        assert_eq!(buffer[0].arb_id, 0x200);
+    }
+
+    // --- drain_buffer ---
+
+    #[test]
+    fn drain_buffer_empty() {
+        let mut buffer = VecDeque::new();
+        let drained = drain_buffer(&mut buffer, 100);
+        assert!(drained.is_empty());
+    }
+
+    #[test]
+    fn drain_buffer_partial() {
+        let mut buffer: VecDeque<CanMessage> =
+            make_msgs(&[0x100, 0x200, 0x300, 0x400, 0x500]).into();
+        let drained = drain_buffer(&mut buffer, 3);
+        assert_eq!(drained.len(), 3);
+        assert_eq!(drained[0].arb_id, 0x100);
+        assert_eq!(drained[1].arb_id, 0x200);
+        assert_eq!(drained[2].arb_id, 0x300);
+        // 2 remaining
+        assert_eq!(buffer.len(), 2);
+        assert_eq!(buffer[0].arb_id, 0x400);
+    }
+
+    #[test]
+    fn drain_buffer_all() {
+        let mut buffer: VecDeque<CanMessage> = make_msgs(&[0x100, 0x200]).into();
+        let drained = drain_buffer(&mut buffer, 100);
+        assert_eq!(drained.len(), 2);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn drain_buffer_zero_limit() {
+        let mut buffer: VecDeque<CanMessage> = make_msgs(&[0x100]).into();
+        let drained = drain_buffer(&mut buffer, 0);
+        assert!(drained.is_empty());
+        assert_eq!(buffer.len(), 1); // unchanged
+    }
+
+    // --- push then drain cycle ---
+
+    #[test]
+    fn push_drain_cycle() {
+        let mut buffer = VecDeque::new();
+        let mut stats = RxBufferStats::default();
+        let capacity = 64;
+
+        // Simulate several push/drain cycles
+        for i in 0..10u32 {
+            let batch: Vec<u32> = (i * 10..i * 10 + 10).collect();
+            push_messages(&mut buffer, &mut stats, capacity, make_msgs(&batch));
+        }
+        assert_eq!(buffer.len(), 64); // capped at capacity
+        assert_eq!(stats.dropped_frames, 100 - 64); // 36 dropped
+
+        let drained = drain_buffer(&mut buffer, 64);
+        assert_eq!(drained.len(), 64);
+        assert!(buffer.is_empty());
+        // First drained message should be ID 36 (first 36 were dropped)
+        assert_eq!(drained[0].arb_id, 36);
+    }
+
+    // --- WorkerConfig defaults ---
+
+    #[test]
+    fn worker_config_defaults() {
+        // Clear any env vars that might interfere
+        std::env::remove_var("J2534_BRIDGE_RX_CAPACITY");
+        std::env::remove_var("J2534_BRIDGE_POLL_INTERVAL_MS");
+        std::env::remove_var("J2534_BRIDGE_PUMP_BATCH_SIZE");
+        std::env::remove_var("J2534_BRIDGE_PUMP_MAX_DRAIN_READS");
+
+        let config = WorkerConfig::from_env();
+        assert_eq!(config.rx_capacity, DEFAULT_RX_CAPACITY);
+        assert_eq!(config.poll_interval, Duration::from_millis(DEFAULT_POLL_INTERVAL_MS));
+        assert_eq!(config.pump_batch_size, DEFAULT_PUMP_BATCH_SIZE);
+        assert_eq!(config.pump_max_drain_reads, DEFAULT_PUMP_MAX_DRAIN_READS);
+    }
+
+    #[test]
+    fn worker_config_clamping() {
+        std::env::set_var("J2534_BRIDGE_RX_CAPACITY", "0");
+        std::env::set_var("J2534_BRIDGE_POLL_INTERVAL_MS", "0");
+        std::env::set_var("J2534_BRIDGE_PUMP_BATCH_SIZE", "9999");
+        std::env::set_var("J2534_BRIDGE_PUMP_MAX_DRAIN_READS", "9999");
+
+        let config = WorkerConfig::from_env();
+        assert_eq!(config.rx_capacity, 1); // min 1
+        assert_eq!(config.poll_interval, Duration::from_millis(1)); // min 1ms
+        assert_eq!(config.pump_batch_size, MAX_BATCH_SIZE as u32); // clamped to 256
+        assert_eq!(config.pump_max_drain_reads, MAX_DRAIN_READS as u32); // clamped to 256
+
+        // Clean up
+        std::env::remove_var("J2534_BRIDGE_RX_CAPACITY");
+        std::env::remove_var("J2534_BRIDGE_POLL_INTERVAL_MS");
+        std::env::remove_var("J2534_BRIDGE_PUMP_BATCH_SIZE");
+        std::env::remove_var("J2534_BRIDGE_PUMP_MAX_DRAIN_READS");
+    }
+
+    // --- map_can_message ---
+
+    #[test]
+    fn map_can_message_preserves_fields() {
+        let j2534_msg = j2534::CANMessage {
+            timestamp_us: 999999,
+            arb_id: 0x18DA00FF,
+            extended: true,
+            data: vec![0x10, 0x20, 0x30],
+            raw_arb_id: 0x98DA00FF,
+            rx_status: 0x100,
+            data_size: 7,
+            protocol_id: 3,
+        };
+        let mapped = map_can_message(j2534_msg);
+        assert_eq!(mapped.timestamp_us, 999999);
+        assert_eq!(mapped.arb_id, 0x18DA00FF);
+        assert!(mapped.extended);
+        assert_eq!(mapped.data, vec![0x10, 0x20, 0x30]);
+        assert_eq!(mapped.raw_arb_id, 0x98DA00FF);
+        assert_eq!(mapped.rx_status, 0x100);
+        assert_eq!(mapped.data_size, 7);
+        assert_eq!(mapped.protocol_id, 3);
+    }
+
+    #[test]
+    fn map_messages_preserves_order() {
+        let msgs = vec![
+            j2534::CANMessage {
+                timestamp_us: 1,
+                arb_id: 0x100,
+                extended: false,
+                data: vec![],
+                raw_arb_id: 0x100,
+                rx_status: 0,
+                data_size: 0,
+                protocol_id: 5,
+            },
+            j2534::CANMessage {
+                timestamp_us: 2,
+                arb_id: 0x200,
+                extended: false,
+                data: vec![],
+                raw_arb_id: 0x200,
+                rx_status: 0,
+                data_size: 0,
+                protocol_id: 5,
+            },
+        ];
+        let mapped = map_messages(msgs);
+        assert_eq!(mapped.len(), 2);
+        assert_eq!(mapped[0].arb_id, 0x100);
+        assert_eq!(mapped[1].arb_id, 0x200);
+    }
+}

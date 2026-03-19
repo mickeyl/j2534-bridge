@@ -38,7 +38,7 @@ endif
 
 DUMP = $(CARGO) run --bin j2534-dump -- $(SELECTOR) $(BITNESS_ARG) --baud-rate $(BAUD) --timeout-ms $(TIMEOUT_MS) --batch-size $(BATCH_SIZE) --max-drain-reads $(MAX_DRAIN_READS) --interface $(INTERFACE)
 
-.PHONY: help build ensure-bridge ensure-bridge-dev publish-dev list dump dump-std dump-ext dump-both dump-loopback dump-stress-loopback dump-raw dump-isotp
+.PHONY: help test build ensure-bridge ensure-bridge-dev publish-dev list dump dump-std dump-ext dump-both dump-loopback dump-stress-loopback dump-raw dump-isotp
 
 help:
 	@echo "j2534-bridge test presets"
@@ -52,6 +52,7 @@ help:
 	@echo "  EXTRA='...'              Extra args passed to j2534-dump"
 	@echo ""
 	@echo "Targets:"
+	@echo "  make test                  Run unit tests (protocol + worker)"
 	@echo "  make list"
 	@echo "  make ensure-bridge-dev     Build and publish fresh dev bridge binaries for CANcorder"
 	@echo "  make dump DEVICE='My Adapter'"
@@ -61,6 +62,9 @@ help:
 	@echo "  make dump-loopback DEVICE='My Adapter'"
 	@echo "  make dump-raw DEVICE='My Adapter'"
 	@echo "  make dump-isotp DEVICE='My Adapter'"
+
+test:
+	$(CARGO) test
 
 ensure-bridge:
 	$(CARGO) build $(BUILD_TARGET) --bin j2534-bridge
