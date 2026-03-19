@@ -532,7 +532,7 @@ pub fn enumerate_devices() -> Vec<J2534Device> {
 
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
 
-    // Check both 32-bit and 64-bit registry locations
+    // Check both 32-bit and 64-bit registry locations, and both v4.04 and v5.00
     let registry_paths = [
         (
             "SOFTWARE\\PassThruSupport.04.04",
@@ -540,6 +540,14 @@ pub fn enumerate_devices() -> Vec<J2534Device> {
         ),
         (
             "SOFTWARE\\PassThruSupport.04.04",
+            KEY_READ | KEY_WOW64_32KEY,
+        ),
+        (
+            "SOFTWARE\\PassThruSupport.05.00",
+            KEY_READ | KEY_WOW64_64KEY,
+        ),
+        (
+            "SOFTWARE\\PassThruSupport.05.00",
             KEY_READ | KEY_WOW64_32KEY,
         ),
     ];
