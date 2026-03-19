@@ -205,6 +205,9 @@ fn handle_request(
                     can_iso11898: d.can_iso11898,
                     compatible: d.compatible,
                     bitness: d.bitness,
+                    available: d.available,
+                    unavailable_reason: d.unavailable_reason,
+                    api_version: d.api_version,
                 })
                 .collect();
             Response::ok(ResponseData::Devices(device_infos))

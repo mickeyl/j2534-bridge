@@ -926,6 +926,9 @@ mod app {
                 can_iso11898: cli.protocol_id == 5,
                 compatible: true,
                 bitness,
+                available: true,
+                unavailable_reason: None,
+                api_version: String::new(),
             });
         }
 

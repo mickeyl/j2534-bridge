@@ -228,6 +228,9 @@ pub struct DeviceInfo {
     pub can_iso11898: bool,
     pub compatible: bool,
     pub bitness: u8,
+    pub available: bool,
+    pub unavailable_reason: Option<String>,
+    pub api_version: String,
 }
 
 /// CAN / K-Line message
@@ -652,6 +655,9 @@ mod tests {
             can_iso11898: true,
             compatible: true,
             bitness: 32,
+            available: true,
+            unavailable_reason: None,
+            api_version: "04.04".to_string(),
         };
         let resp = Response::ok(ResponseData::Devices(vec![device]));
         let json = serde_json::to_string(&resp).unwrap();
@@ -664,6 +670,9 @@ mod tests {
                 assert_eq!(devs[0].name, "OpenPort 2.0");
                 assert_eq!(devs[0].bitness, 32);
                 assert!(devs[0].compatible);
+                assert!(devs[0].available);
+                assert!(devs[0].unavailable_reason.is_none());
+                assert_eq!(devs[0].api_version, "04.04");
             }
             _ => panic!("Expected Ok with Devices"),
         }

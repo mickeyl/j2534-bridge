@@ -287,6 +287,9 @@ pub struct J2534Device {
     pub can_iso11898: bool,
     pub compatible: bool,
     pub bitness: u8,
+    pub available: bool,
+    pub unavailable_reason: Option<String>,
+    pub api_version: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -439,6 +442,73 @@ fn get_dll_bitness(dll_path: &str) -> Option<u8> {
     }
 }
 
+/// Detect J2534 API version by probing for v5.0 symbol exports.
+/// Results are cached persistently keyed by DLL path + modification time
+/// to avoid loading DLLs on every enumeration.
+pub fn detect_api_version(dll_path: &str) -> String {
+    let modified = std::fs::metadata(dll_path)
+        .and_then(|m| m.modified())
+        .ok();
+    let cache_key = match &modified {
+        Some(t) => format!(
+            "{}|{}",
+            dll_path,
+            t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+        ),
+        None => dll_path.to_string(),
+    };
+
+    if let Some(cached) = api_version_cache_read(&cache_key) {
+        return cached;
+    }
+
+    let version = detect_api_version_uncached(dll_path);
+    api_version_cache_write(&cache_key, &version);
+    version
+}
+
+fn detect_api_version_uncached(dll_path: &str) -> String {
+    let lib = match unsafe { libloading::Library::new(dll_path) } {
+        Ok(lib) => lib,
+        Err(_) => return "04.04".to_string(),
+    };
+    let has_scan: bool =
+        unsafe { lib.get::<*const ()>(b"PassThruScanForDevices\0").is_ok() };
+    if has_scan {
+        "05.00".to_string()
+    } else {
+        "04.04".to_string()
+    }
+}
+
+fn api_version_cache_path() -> Option<std::path::PathBuf> {
+    std::env::var("LOCALAPPDATA")
+        .ok()
+        .map(|dir| std::path::PathBuf::from(dir).join("j2534-bridge").join("api_version_cache.json"))
+}
+
+fn api_version_cache_read(key: &str) -> Option<String> {
+    let path = api_version_cache_path()?;
+    let content = std::fs::read_to_string(&path).ok()?;
+    let map: std::collections::HashMap<String, String> = serde_json::from_str(&content).ok()?;
+    map.get(key).cloned()
+}
+
+fn api_version_cache_write(key: &str, value: &str) {
+    let Some(path) = api_version_cache_path() else { return };
+    let mut map: std::collections::HashMap<String, String> = path
+        .exists()
+        .then(|| std::fs::read_to_string(&path).ok())
+        .flatten()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or_default();
+    map.insert(key.to_string(), value.to_string());
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, serde_json::to_string_pretty(&map).unwrap_or_default());
+}
+
 fn clean_device_name(name: &str) -> String {
     let mut clean = name.to_string();
     for marker in [
@@ -494,11 +564,22 @@ pub fn enumerate_devices() -> Vec<J2534Device> {
                         continue;
                     }
 
-                    let bitness = get_dll_bitness(&dll_path).unwrap_or(if cfg!(target_pointer_width = "64") {
-                        64
-                    } else {
-                        32
-                    });
+                    let bitness_result = get_dll_bitness(&dll_path);
+                    let (available, unavailable_reason, api_version, bitness) =
+                        match bitness_result {
+                            None => (
+                                false,
+                                Some("DLL not found".to_string()),
+                                "04.04".to_string(),
+                                if cfg!(target_pointer_width = "64") { 64 } else { 32 },
+                            ),
+                            Some(bits) => (
+                                true,
+                                None,
+                                detect_api_version(&dll_path),
+                                bits,
+                            ),
+                        };
                     let clean_name = clean_device_name(&name);
 
                     devices.push(J2534Device {
@@ -509,6 +590,9 @@ pub fn enumerate_devices() -> Vec<J2534Device> {
                         can_iso11898: can_iso11898 != 0,
                         compatible: true,
                         bitness,
+                        available,
+                        unavailable_reason,
+                        api_version,
                     });
                 }
             }
