@@ -447,14 +447,14 @@ fn get_dll_bitness(dll_path: &str) -> Option<u8> {
 /// Results are cached persistently keyed by DLL path + modification time
 /// to avoid loading DLLs on every enumeration.
 pub fn detect_api_version(dll_path: &str) -> String {
-    let modified = std::fs::metadata(dll_path)
-        .and_then(|m| m.modified())
-        .ok();
+    let modified = std::fs::metadata(dll_path).and_then(|m| m.modified()).ok();
     let cache_key = match &modified {
         Some(t) => format!(
             "{}|{}",
             dll_path,
-            t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+            t.duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
         ),
         None => dll_path.to_string(),
     };
@@ -473,8 +473,7 @@ fn detect_api_version_uncached(dll_path: &str) -> String {
         Ok(lib) => lib,
         Err(_) => return "04.04".to_string(),
     };
-    let has_scan: bool =
-        unsafe { lib.get::<*const ()>(b"PassThruScanForDevices\0").is_ok() };
+    let has_scan: bool = unsafe { lib.get::<*const ()>(b"PassThruScanForDevices\0").is_ok() };
     if has_scan {
         "05.00".to_string()
     } else {
@@ -483,9 +482,11 @@ fn detect_api_version_uncached(dll_path: &str) -> String {
 }
 
 fn api_version_cache_path() -> Option<std::path::PathBuf> {
-    std::env::var("LOCALAPPDATA")
-        .ok()
-        .map(|dir| std::path::PathBuf::from(dir).join("j2534-bridge").join("api_version_cache.json"))
+    std::env::var("LOCALAPPDATA").ok().map(|dir| {
+        std::path::PathBuf::from(dir)
+            .join("j2534-bridge")
+            .join("api_version_cache.json")
+    })
 }
 
 fn api_version_cache_read(key: &str) -> Option<String> {
@@ -496,7 +497,9 @@ fn api_version_cache_read(key: &str) -> Option<String> {
 }
 
 fn api_version_cache_write(key: &str, value: &str) {
-    let Some(path) = api_version_cache_path() else { return };
+    let Some(path) = api_version_cache_path() else {
+        return;
+    };
     let mut map: std::collections::HashMap<String, String> = path
         .exists()
         .then(|| std::fs::read_to_string(&path).ok())
@@ -507,7 +510,10 @@ fn api_version_cache_write(key: &str, value: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(&path, serde_json::to_string_pretty(&map).unwrap_or_default());
+    let _ = std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&map).unwrap_or_default(),
+    );
 }
 
 fn clean_device_name(name: &str) -> String {
@@ -567,8 +573,7 @@ pub fn enumerate_devices() -> Vec<J2534Device> {
                     let default_protocol: u32 = if is_v5_registry { 1 } else { 0 };
                     let can_iso15765: u32 =
                         device_key.get_value("ISO15765").unwrap_or(default_protocol);
-                    let can_iso11898: u32 =
-                        device_key.get_value("CAN").unwrap_or(default_protocol);
+                    let can_iso11898: u32 = device_key.get_value("CAN").unwrap_or(default_protocol);
 
                     // Collect all supported protocols from registry
                     let mut supported_protocols = Vec::new();
@@ -586,7 +591,11 @@ pub fn enumerate_devices() -> Vec<J2534Device> {
                     ];
                     for &(reg_key, display_name) in protocol_keys {
                         let val: u32 = device_key.get_value(reg_key).unwrap_or(
-                            if is_v5_registry && (reg_key == "CAN" || reg_key == "ISO15765") { 1 } else { 0 }
+                            if is_v5_registry && (reg_key == "CAN" || reg_key == "ISO15765") {
+                                1
+                            } else {
+                                0
+                            },
                         );
                         if val != 0 {
                             supported_protocols.push(display_name.to_string());
@@ -603,29 +612,27 @@ pub fn enumerate_devices() -> Vec<J2534Device> {
                     }
 
                     let bitness_result = get_dll_bitness(&dll_path);
-                    let (available, unavailable_reason, api_version, bitness) =
-                        match bitness_result {
-                            None => (
-                                false,
-                                Some("DLL not found".to_string()),
-                                if is_v5_registry {
-                                    "05.00".to_string()
-                                } else {
-                                    "04.04".to_string()
-                                },
-                                if cfg!(target_pointer_width = "64") { 64 } else { 32 },
-                            ),
-                            Some(bits) => (
-                                true,
-                                None,
-                                detect_api_version(&dll_path),
-                                bits,
-                            ),
-                        };
+                    let (available, unavailable_reason, api_version, bitness) = match bitness_result
+                    {
+                        None => (
+                            false,
+                            Some("DLL not found".to_string()),
+                            if is_v5_registry {
+                                "05.00".to_string()
+                            } else {
+                                "04.04".to_string()
+                            },
+                            if cfg!(target_pointer_width = "64") {
+                                64
+                            } else {
+                                32
+                            },
+                        ),
+                        Some(bits) => (true, None, detect_api_version(&dll_path), bits),
+                    };
                     let mut clean_name = clean_device_name(&name);
                     // Disambiguate v5.0 entries from their v4.04 counterparts
-                    if is_v5_registry
-                        && devices.iter().any(|d: &J2534Device| d.name == clean_name)
+                    if is_v5_registry && devices.iter().any(|d: &J2534Device| d.name == clean_name)
                     {
                         clean_name = format!("{} (v5.0)", clean_name);
                     }
@@ -777,9 +784,7 @@ impl J2534Connection {
                     "ERR_J2534_CONNECT_FAILED: error code {} ({}){}",
                     result,
                     error_code_to_string(result),
-                    last_error
-                        .map(|s| format!(" - {}", s))
-                        .unwrap_or_default()
+                    last_error.map(|s| format!(" - {}", s)).unwrap_or_default()
                 ));
             }
         }
@@ -801,15 +806,23 @@ impl J2534Connection {
 
         progress_callback(J2534Progress {
             step: "set_filter".to_string(),
-            status: if needs_filter { "in_progress" } else { "success" }.to_string(),
-            message: if needs_filter { None } else { Some("Skipped (not required for this protocol)".to_string()) },
+            status: if needs_filter {
+                "in_progress"
+            } else {
+                "success"
+            }
+            .to_string(),
+            message: if needs_filter {
+                None
+            } else {
+                Some("Skipped (not required for this protocol)".to_string())
+            },
         });
 
         if is_kline_protocol {
             unsafe {
-                let filter_fn: Symbol<PassThruStartMsgFilterFn> = library
-                    .get(b"PassThruStartMsgFilter\0")
-                    .map_err(|e| {
+                let filter_fn: Symbol<PassThruStartMsgFilterFn> =
+                    library.get(b"PassThruStartMsgFilter\0").map_err(|e| {
                         format!("ERR_J2534_FUNC_NOT_FOUND: PassThruStartMsgFilter - {}", e)
                     })?;
 
@@ -850,9 +863,8 @@ impl J2534Connection {
 
         if is_can_protocol {
             unsafe {
-                let filter_fn: Symbol<PassThruStartMsgFilterFn> = library
-                    .get(b"PassThruStartMsgFilter\0")
-                    .map_err(|e| {
+                let filter_fn: Symbol<PassThruStartMsgFilterFn> =
+                    library.get(b"PassThruStartMsgFilter\0").map_err(|e| {
                         format!("ERR_J2534_FUNC_NOT_FOUND: PassThruStartMsgFilter - {}", e)
                     })?;
 
@@ -938,12 +950,10 @@ impl J2534Connection {
         // reliable way to capture extended frames.
         let channel_id_29bit = if connect_flags == CAN_ID_BOTH {
             let mut ch29: c_ulong = 0;
-            let connect_fn: Option<Symbol<PassThruConnectFn>> = unsafe {
-                library.get(b"PassThruConnect\0").ok()
-            };
-            let filter_fn_29: Option<Symbol<PassThruStartMsgFilterFn>> = unsafe {
-                library.get(b"PassThruStartMsgFilter\0").ok()
-            };
+            let connect_fn: Option<Symbol<PassThruConnectFn>> =
+                unsafe { library.get(b"PassThruConnect\0").ok() };
+            let filter_fn_29: Option<Symbol<PassThruStartMsgFilterFn>> =
+                unsafe { library.get(b"PassThruStartMsgFilter\0").ok() };
 
             let opened = match (connect_fn, filter_fn_29) {
                 (Some(cfn), Some(ffn)) => {
@@ -967,9 +977,8 @@ impl J2534Connection {
                         p.tx_flags = CAN_29BIT_ID;
                         p.data_size = 4;
                         let mut fid: c_ulong = 0;
-                        let fres = unsafe {
-                            ffn(ch29, PASS_FILTER, &m, &p, std::ptr::null(), &mut fid)
-                        };
+                        let fres =
+                            unsafe { ffn(ch29, PASS_FILTER, &m, &p, std::ptr::null(), &mut fid) };
                         if fres != STATUS_NOERROR {
                             eprintln!(
                                 "[j2534] 29-bit channel filter failed: {} ({})",
@@ -1117,7 +1126,8 @@ impl J2534Connection {
             .map(|(arb_id, data, extended)| {
                 let mut msg = PassThruMsg::default();
                 msg.protocol_id = self.protocol_id;
-                let is_can = self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765;
+                let is_can =
+                    self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765;
                 if is_can {
                     msg.tx_flags = if *extended { CAN_29BIT_ID } else { 0 };
                     msg.data[0] = ((arb_id >> 24) & 0xFF) as u8;
@@ -1172,11 +1182,12 @@ impl J2534Connection {
             sent.retain(|m| m.timestamp > cutoff);
 
             for (arb_id, data, _) in messages.iter().take(num_msgs as usize) {
-                let data_len = if self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765 {
-                    data.len().min(8)
-                } else {
-                    data.len()
-                };
+                let data_len =
+                    if self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765 {
+                        data.len().min(8)
+                    } else {
+                        data.len()
+                    };
                 sent.push(SentMessage {
                     arb_id: *arb_id,
                     data: data[..data_len].to_vec(),
@@ -1206,7 +1217,8 @@ impl J2534Connection {
             .map(|(arb_id, data, extended)| {
                 let mut msg = PassThruMsg::default();
                 msg.protocol_id = self.protocol_id;
-                let is_can = self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765;
+                let is_can =
+                    self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765;
                 if is_can {
                     msg.tx_flags = if *extended { CAN_29BIT_ID } else { 0 };
                     msg.data[0] = ((arb_id >> 24) & 0xFF) as u8;
@@ -1250,11 +1262,12 @@ impl J2534Connection {
             sent.retain(|m| m.timestamp > cutoff);
 
             for (arb_id, data, _) in messages.iter().take(num_msgs as usize) {
-                let data_len = if self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765 {
-                    data.len().min(8)
-                } else {
-                    data.len()
-                };
+                let data_len =
+                    if self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765 {
+                        data.len().min(8)
+                    } else {
+                        data.len()
+                    };
                 sent.push(SentMessage {
                     arb_id: *arb_id,
                     data: data[..data_len].to_vec(),
@@ -1370,8 +1383,7 @@ impl J2534Connection {
                 let is_tx_echo = if include_loopback {
                     false
                 } else if let Ok(mut sent) = self.sent_messages.lock() {
-                    let cutoff =
-                        std::time::Instant::now() - std::time::Duration::from_millis(500);
+                    let cutoff = std::time::Instant::now() - std::time::Duration::from_millis(500);
                     sent.retain(|m| m.timestamp > cutoff);
 
                     if let Some(pos) = sent
@@ -1459,14 +1471,8 @@ impl J2534Connection {
             let t = if iteration == 0 { timeout_ms } else { 0 };
             let mut num_msgs = batch_size as c_ulong;
 
-            let result = unsafe {
-                read_fn(
-                    self.channel_id,
-                    msg_buffer.as_mut_ptr(),
-                    &mut num_msgs,
-                    t,
-                )
-            };
+            let result =
+                unsafe { read_fn(self.channel_id, msg_buffer.as_mut_ptr(), &mut num_msgs, t) };
 
             // Allow STATUS_NOERROR, ERR_BUFFER_EMPTY, and ERR_TIMEOUT
             if result != STATUS_NOERROR && result != ERR_BUFFER_EMPTY && result != ERR_TIMEOUT {
@@ -1498,12 +1504,8 @@ impl J2534Connection {
                         continue;
                     }
 
-                    let arb_id = u32::from_be_bytes([
-                        msg.data[0],
-                        msg.data[1],
-                        msg.data[2],
-                        msg.data[3],
-                    ]);
+                    let arb_id =
+                        u32::from_be_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
                     let data_len = (msg.data_size - 4) as usize;
                     let data = msg.data[4..4 + data_len].to_vec();
                     let extended = (msg.rx_status & RX_CAN_29BIT_ID) != 0;
@@ -1514,8 +1516,9 @@ impl J2534Connection {
                             std::time::Instant::now() - std::time::Duration::from_millis(500);
                         sent.retain(|m| m.timestamp > cutoff);
 
-                        if let Some(pos) =
-                            sent.iter().position(|m| m.arb_id == arb_id && m.data == data)
+                        if let Some(pos) = sent
+                            .iter()
+                            .position(|m| m.arb_id == arb_id && m.data == data)
                         {
                             sent.remove(pos);
                             true
@@ -1574,14 +1577,9 @@ impl J2534Connection {
 
             for _ in 0..max_drain_reads {
                 let mut num_msgs = batch_size as c_ulong;
-                let result = unsafe {
-                    read_fn(ch29, msg_buffer_29.as_mut_ptr(), &mut num_msgs, 0)
-                };
+                let result = unsafe { read_fn(ch29, msg_buffer_29.as_mut_ptr(), &mut num_msgs, 0) };
 
-                if result != STATUS_NOERROR
-                    && result != ERR_BUFFER_EMPTY
-                    && result != ERR_TIMEOUT
-                {
+                if result != STATUS_NOERROR && result != ERR_BUFFER_EMPTY && result != ERR_TIMEOUT {
                     break;
                 }
                 if num_msgs == 0 {
@@ -1597,12 +1595,8 @@ impl J2534Connection {
                         continue;
                     }
 
-                    let arb_id = u32::from_be_bytes([
-                        msg.data[0],
-                        msg.data[1],
-                        msg.data[2],
-                        msg.data[3],
-                    ]);
+                    let arb_id =
+                        u32::from_be_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
                     let data_len = (msg.data_size - 4) as usize;
                     let data = msg.data[4..4 + data_len].to_vec();
                     // Always extended on this channel
@@ -1612,8 +1606,9 @@ impl J2534Connection {
                         let cutoff =
                             std::time::Instant::now() - std::time::Duration::from_millis(500);
                         sent.retain(|m| m.timestamp > cutoff);
-                        if let Some(pos) =
-                            sent.iter().position(|m| m.arb_id == arb_id && m.data == data)
+                        if let Some(pos) = sent
+                            .iter()
+                            .position(|m| m.arb_id == arb_id && m.data == data)
                         {
                             sent.remove(pos);
                             true
@@ -1698,9 +1693,7 @@ impl J2534Connection {
             let read_version_fn: Symbol<PassThruReadVersionFn> = self
                 .library
                 .get(b"PassThruReadVersion\0")
-                .map_err(|e| {
-                    format!("ERR_J2534_FUNC_NOT_FOUND: PassThruReadVersion - {}", e)
-                })?;
+                .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruReadVersion - {}", e))?;
 
             let result = read_version_fn(
                 self.device_id,
@@ -1742,9 +1735,7 @@ impl J2534Connection {
             let get_last_error_fn: Symbol<PassThruGetLastErrorFn> = self
                 .library
                 .get(b"PassThruGetLastError\0")
-                .map_err(|e| {
-                    format!("ERR_J2534_FUNC_NOT_FOUND: PassThruGetLastError - {}", e)
-                })?;
+                .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruGetLastError - {}", e))?;
 
             get_last_error_fn(error_msg.as_mut_ptr());
         }
@@ -1845,10 +1836,7 @@ impl J2534Connection {
                 .library
                 .get(b"PassThruStartPeriodicMsg\0")
                 .map_err(|e| {
-                    format!(
-                        "ERR_J2534_FUNC_NOT_FOUND: PassThruStartPeriodicMsg - {}",
-                        e
-                    )
+                    format!("ERR_J2534_FUNC_NOT_FOUND: PassThruStartPeriodicMsg - {}", e)
                 })?;
 
             let result = start_periodic_fn(self.channel_id, &msg, &mut msg_id, interval_ms);
@@ -1871,10 +1859,7 @@ impl J2534Connection {
                 .library
                 .get(b"PassThruStopPeriodicMsg\0")
                 .map_err(|e| {
-                    format!(
-                        "ERR_J2534_FUNC_NOT_FOUND: PassThruStopPeriodicMsg - {}",
-                        e
-                    )
+                    format!("ERR_J2534_FUNC_NOT_FOUND: PassThruStopPeriodicMsg - {}", e)
                 })?;
 
             let result = stop_periodic_fn(self.channel_id, msg_id);
@@ -1945,9 +1930,7 @@ impl J2534Connection {
             let filter_fn: Symbol<PassThruStartMsgFilterFn> = self
                 .library
                 .get(b"PassThruStartMsgFilter\0")
-                .map_err(|e| {
-                    format!("ERR_J2534_FUNC_NOT_FOUND: PassThruStartMsgFilter - {}", e)
-                })?;
+                .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruStartMsgFilter - {}", e))?;
 
             let result = filter_fn(
                 self.channel_id,
@@ -1981,9 +1964,7 @@ impl J2534Connection {
         let pattern_len = pattern.len().min(12);
 
         if mask_len == 0 || pattern_len == 0 {
-            return Err(
-                "ERR_J2534_ADD_FILTER_FAILED: mask/pattern must be 1-12 bytes".to_string(),
-            );
+            return Err("ERR_J2534_ADD_FILTER_FAILED: mask/pattern must be 1-12 bytes".to_string());
         }
 
         let mut mask_msg = PassThruMsg::default();
@@ -2004,9 +1985,7 @@ impl J2534Connection {
             let filter_fn: Symbol<PassThruStartMsgFilterFn> = self
                 .library
                 .get(b"PassThruStartMsgFilter\0")
-                .map_err(|e| {
-                    format!("ERR_J2534_FUNC_NOT_FOUND: PassThruStartMsgFilter - {}", e)
-                })?;
+                .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruStartMsgFilter - {}", e))?;
 
             let result = filter_fn(
                 self.channel_id,
@@ -2034,9 +2013,7 @@ impl J2534Connection {
             let stop_filter_fn: Symbol<PassThruStopMsgFilterFn> = self
                 .library
                 .get(b"PassThruStopMsgFilter\0")
-                .map_err(|e| {
-                    format!("ERR_J2534_FUNC_NOT_FOUND: PassThruStopMsgFilter - {}", e)
-                })?;
+                .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruStopMsgFilter - {}", e))?;
 
             let result = stop_filter_fn(self.channel_id, filter_id);
             if result != STATUS_NOERROR {
@@ -2187,9 +2164,7 @@ impl J2534Connection {
                     "ERR_J2534_FAST_INIT_FAILED: error code {} ({}){}",
                     result,
                     error_code_to_string(result),
-                    last_error
-                        .map(|s| format!(" - {}", s))
-                        .unwrap_or_default()
+                    last_error.map(|s| format!(" - {}", s)).unwrap_or_default()
                 ));
             }
         }
@@ -2267,8 +2242,8 @@ impl J2534Connection {
         };
 
         // Poll for CC — tight loop, no IPC, directly against the DLL
-        let deadline = std::time::Instant::now()
-            + std::time::Duration::from_millis(cc_timeout_ms as u64);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(cc_timeout_ms as u64);
         let mut cc_received = false;
         let mut extra_frames: Vec<CANMessage> = Vec::new();
 
@@ -2291,7 +2266,9 @@ impl J2534Connection {
 
         eprintln!(
             "[j2534] kline_slow_init_with_cc: protocol={} cc={} extra_frames={}",
-            detected_protocol, cc_received, extra_frames.len()
+            detected_protocol,
+            cc_received,
+            extra_frames.len()
         );
 
         let mut init_response = vec![init_resp];
@@ -2337,9 +2314,7 @@ impl J2534Connection {
                     "ERR_J2534_FIVE_BAUD_INIT_FAILED: error code {} ({}){}",
                     result,
                     error_code_to_string(result),
-                    last_error
-                        .map(|s| format!(" - {}", s))
-                        .unwrap_or_default()
+                    last_error.map(|s| format!(" - {}", s)).unwrap_or_default()
                 ));
             }
         }

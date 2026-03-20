@@ -880,7 +880,9 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: Response = serde_json::from_str(&json).unwrap();
         match parsed {
-            Response::Ok { data: ResponseData::Devices(d) } => assert!(d.is_empty()),
+            Response::Ok {
+                data: ResponseData::Devices(d),
+            } => assert!(d.is_empty()),
             other => {
                 // Accept whatever serde picks — the key point is it doesn't error
                 assert!(matches!(other, Response::Ok { .. }));

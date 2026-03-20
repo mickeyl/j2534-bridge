@@ -8,10 +8,12 @@ fn main() {
 mod app {
     use clap::{Parser, ValueEnum};
     use j2534_bridge::client::BridgeClient;
-    use j2534_bridge::protocol::{CanMessage, DeviceInfo, KlineInitMode as ProtoKlineInitMode, RawIoResult};
+    use j2534_bridge::protocol::{
+        CanMessage, DeviceInfo, KlineInitMode as ProtoKlineInitMode, RawIoResult,
+    };
     use std::path::Path;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     const PASS_FILTER: u32 = 1;
@@ -61,9 +63,14 @@ mod app {
 
     #[derive(Parser, Debug)]
     #[command(name = "j2534-dump")]
-    #[command(about = "Exercise J2534 bridge open/filter/config parameters and dump traffic in a candump-style text format")]
+    #[command(
+        about = "Exercise J2534 bridge open/filter/config parameters and dump traffic in a candump-style text format"
+    )]
     struct Cli {
-        #[arg(long, help = "List devices visible through the selected bridge bitness and exit")]
+        #[arg(
+            long,
+            help = "List devices visible through the selected bridge bitness and exit"
+        )]
         list: bool,
 
         #[arg(long, help = "Exact device name from registry enumeration")]
@@ -72,28 +79,56 @@ mod app {
         #[arg(long, help = "Path to the vendor J2534 DLL")]
         dll_path: Option<String>,
 
-        #[arg(long, help = "Bridge/J2534 DLL bitness: 32 or 64. Auto-detected from DLL when possible")]
+        #[arg(
+            long,
+            help = "Bridge/J2534 DLL bitness: 32 or 64. Auto-detected from DLL when possible"
+        )]
         bitness: Option<u8>,
 
-        #[arg(long, default_value_t = 5, help = "J2534 ProtocolID to open, e.g. 5=CAN, 6=ISO15765")]
+        #[arg(
+            long,
+            default_value_t = 5,
+            help = "J2534 ProtocolID to open, e.g. 5=CAN, 6=ISO15765"
+        )]
         protocol_id: u32,
 
-        #[arg(long, value_enum, help = "K-Line init mode: none, fast, slow, auto. Defaults to fast for ISO14230 and slow for ISO9141.")]
+        #[arg(
+            long,
+            value_enum,
+            help = "K-Line init mode: none, fast, slow, auto. Defaults to fast for ISO14230 and slow for ISO9141."
+        )]
         kline_init_mode: Option<KlineInitMode>,
 
-        #[arg(long, help = "Run FAST_INIT after connect with the given hex bytes. For ISO14230, defaults to C133F18166 if omitted.")]
+        #[arg(
+            long,
+            help = "Run FAST_INIT after connect with the given hex bytes. For ISO14230, defaults to C133F18166 if omitted."
+        )]
         fast_init: Option<String>,
 
-        #[arg(long, help = "Run FIVE_BAUD_INIT after connect with the given hex bytes. For ISO9141, defaults to 33 if omitted.")]
+        #[arg(
+            long,
+            help = "Run FIVE_BAUD_INIT after connect with the given hex bytes. For ISO9141, defaults to 33 if omitted."
+        )]
         five_baud_init: Option<String>,
 
-        #[arg(long, help = "Send a post-init K-Line request payload as hex bytes, e.g. 3E or 1081. The tool wraps it using protocol-appropriate framing.")]
+        #[arg(
+            long,
+            help = "Send a post-init K-Line request payload as hex bytes, e.g. 3E or 1081. The tool wraps it using protocol-appropriate framing."
+        )]
         kline_request: Option<String>,
 
-        #[arg(long, default_value_t = 1000, help = "Quiet period after K-Line init before sending the first post-init request/keepalive")]
+        #[arg(
+            long,
+            default_value_t = 1000,
+            help = "Quiet period after K-Line init before sending the first post-init request/keepalive"
+        )]
         kline_post_init_idle_ms: u64,
 
-        #[arg(long, default_value_t = 0, help = "Drain K-Line RX for this many milliseconds immediately after init, before the first post-init request")]
+        #[arg(
+            long,
+            default_value_t = 0,
+            help = "Drain K-Line RX for this many milliseconds immediately after init, before the first post-init request"
+        )]
         kline_post_init_drain_ms: u32,
 
         #[arg(long, default_value = "0x33", help = "KWP target/arbitration address")]
@@ -111,10 +146,18 @@ mod app {
         #[arg(long, default_value = "0xF1", help = "ISO9141 tester address")]
         kline_iso_tester: String,
 
-        #[arg(long, default_value_t = 500, help = "Read timeout after post-init K-Line request")]
+        #[arg(
+            long,
+            default_value_t = 500,
+            help = "Read timeout after post-init K-Line request"
+        )]
         kline_request_timeout_ms: u32,
 
-        #[arg(long, default_value_t = 0, help = "Send TesterPresent (3E) every N ms during capture to keep the K-Line session alive. 0 = disabled.")]
+        #[arg(
+            long,
+            default_value_t = 0,
+            help = "Send TesterPresent (3E) every N ms during capture to keep the K-Line session alive. 0 = disabled."
+        )]
         kline_keepalive_ms: u64,
 
         #[arg(long, default_value_t = 500_000)]
@@ -123,7 +166,10 @@ mod app {
         #[arg(long, value_enum, default_value_t = ConnectMode::Both)]
         connect_mode: ConnectMode,
 
-        #[arg(long, help = "Raw PassThruConnect Flags value. Overrides --connect-mode")]
+        #[arg(
+            long,
+            help = "Raw PassThruConnect Flags value. Overrides --connect-mode"
+        )]
         connect_flags: Option<String>,
 
         #[arg(long, help = "Call PassThruSetLoopback after connect")]
@@ -132,13 +178,24 @@ mod app {
         #[arg(long, help = "Clear TX/RX buffers after open and before capture")]
         clear_buffers: bool,
 
-        #[arg(long, help = "Clear all message filters after open, before applying --filter entries")]
+        #[arg(
+            long,
+            help = "Clear all message filters after open, before applying --filter entries"
+        )]
         clear_filters: bool,
 
-        #[arg(long = "set-config", value_name = "PARAM=VALUE", help = "Repeatable J2534 SET_CONFIG parameter, decimal or 0x hex")]
+        #[arg(
+            long = "set-config",
+            value_name = "PARAM=VALUE",
+            help = "Repeatable J2534 SET_CONFIG parameter, decimal or 0x hex"
+        )]
         set_configs: Vec<String>,
 
-        #[arg(long = "filter", value_name = "SPEC", help = "Repeatable filter: type:mask:pattern[:extended][:raw]. Example: pass:00000000:00000000:true:false")]
+        #[arg(
+            long = "filter",
+            value_name = "SPEC",
+            help = "Repeatable filter: type:mask:pattern[:extended][:raw]. Example: pass:00000000:00000000:true:false"
+        )]
         filters: Vec<String>,
 
         #[arg(long, value_enum, default_value_t = ReadMode::Drain)]
@@ -168,7 +225,10 @@ mod app {
         #[arg(long, help = "Append printable ASCII like candump -a")]
         ascii: bool,
 
-        #[arg(long, help = "Append raw J2534 fields (rx_status, data_size, raw arbitration field)")]
+        #[arg(
+            long,
+            help = "Append raw J2534 fields (rx_status, data_size, raw arbitration field)"
+        )]
         raw_details: bool,
 
         #[arg(long, help = "Print device API/DLL/firmware version after open")]
@@ -180,16 +240,28 @@ mod app {
         #[arg(long, help = "Print DATA_RATE and current loopback state after open")]
         show_state: bool,
 
-        #[arg(long, default_value_t = 100, help = "Number of frames to send in stress-loopback mode")]
+        #[arg(
+            long,
+            default_value_t = 100,
+            help = "Number of frames to send in stress-loopback mode"
+        )]
         loopback_count: u32,
 
-        #[arg(long, default_value = "0x7DF", help = "Arbitration ID for stress-loopback TX frames")]
+        #[arg(
+            long,
+            default_value = "0x7DF",
+            help = "Arbitration ID for stress-loopback TX frames"
+        )]
         loopback_id: String,
 
         #[arg(long, help = "Use 29-bit extended ID for stress-loopback TX frames")]
         loopback_extended: bool,
 
-        #[arg(long, default_value_t = 10, help = "Delay in milliseconds between stress-loopback TX frames")]
+        #[arg(
+            long,
+            default_value_t = 10,
+            help = "Delay in milliseconds between stress-loopback TX frames"
+        )]
         loopback_interval_ms: u64,
     }
 
@@ -340,10 +412,7 @@ mod app {
             .map(|s| parse_hex_bytes(s))
             .transpose()?;
 
-        eprintln!(
-            "[j2534-dump] K-Line init mode={:?}",
-            protocol_mode
-        );
+        eprintln!("[j2534-dump] K-Line init mode={:?}", protocol_mode);
 
         let result = bridge.kline_init(protocol_mode, fast_data, slow_addr, Some(300))?;
 
@@ -407,7 +476,10 @@ mod app {
             if drained.is_empty() {
                 eprintln!("[j2534-dump] no immediate post-init RX frames");
             } else {
-                eprintln!("[j2534-dump] immediate post-init RX frames={}", drained.len());
+                eprintln!(
+                    "[j2534-dump] immediate post-init RX frames={}",
+                    drained.len()
+                );
                 for msg in &drained {
                     println!(
                         "{}",
@@ -463,9 +535,16 @@ mod app {
 
         bridge.send_message(0, &frame, false)?;
 
-        let responses = bridge.read_messages_drain(cli.kline_request_timeout_ms, cli.batch_size, cli.max_drain_reads)?;
+        let responses = bridge.read_messages_drain(
+            cli.kline_request_timeout_ms,
+            cli.batch_size,
+            cli.max_drain_reads,
+        )?;
         if responses.is_empty() {
-            eprintln!("[j2534-dump] no post-init response within {} ms", cli.kline_request_timeout_ms);
+            eprintln!(
+                "[j2534-dump] no post-init response within {} ms",
+                cli.kline_request_timeout_ms
+            );
         } else {
             eprintln!("[j2534-dump] post-init responses={}", responses.len());
             for msg in &responses {
@@ -530,9 +609,7 @@ mod app {
             .duration_since(UNIX_EPOCH)
             .map_err(|e| format!("System clock error: {e}"))?;
         let start_epoch_us = start_epoch.as_micros() as u64;
-        let duration_limit = cli
-            .duration_secs
-            .map(Duration::from_secs_f64);
+        let duration_limit = cli.duration_secs.map(Duration::from_secs_f64);
         let mut captured = 0u64;
 
         // K-Line keepalive: build TesterPresent frame once
@@ -552,7 +629,11 @@ mod app {
             build_kline_frame(
                 cli.protocol_id,
                 &[0x3E], // TesterPresent
-                target, source, iso_target, iso_source, iso_tester,
+                target,
+                source,
+                iso_target,
+                iso_source,
+                iso_tester,
             )
             .ok()
         } else {
@@ -646,7 +727,11 @@ mod app {
         Ok(())
     }
 
-    fn stress_loopback(bridge: &mut BridgeClient, cli: &Cli, running: &Arc<AtomicBool>) -> Result<(), String> {
+    fn stress_loopback(
+        bridge: &mut BridgeClient,
+        cli: &Cli,
+        running: &Arc<AtomicBool>,
+    ) -> Result<(), String> {
         let tx_id = parse_u32(&cli.loopback_id)?;
         let extended = cli.loopback_extended;
         let count = cli.loopback_count;
@@ -654,10 +739,7 @@ mod app {
 
         eprintln!(
             "[stress-loopback] sending {} frames, id=0x{:X}, extended={}, interval={}ms",
-            count,
-            tx_id,
-            extended,
-            cli.loopback_interval_ms
+            count, tx_id, extended, cli.loopback_interval_ms
         );
 
         // Enable loopback
@@ -670,7 +752,8 @@ mod app {
         let mut matched = 0u32;
         let mut mismatched = 0u32;
         let mut bus_frames = 0u64;
-        let mut pending: std::collections::VecDeque<(u32, [u8; 8])> = std::collections::VecDeque::new();
+        let mut pending: std::collections::VecDeque<(u32, [u8; 8])> =
+            std::collections::VecDeque::new();
 
         // Marker byte so we can distinguish our frames from bus traffic
         const MARKER: u8 = 0xA5;
@@ -718,7 +801,9 @@ mod app {
                             mismatched += 1;
                             eprintln!(
                                 "[stress-loopback] MISMATCH seq={} expected={:02X?} got={:02X?}",
-                                echo_seq, &expected_payload[..], &msg.data[..]
+                                echo_seq,
+                                &expected_payload[..],
+                                &msg.data[..]
                             );
                         }
                     } else {
@@ -778,13 +863,19 @@ mod app {
 
         eprintln!();
         eprintln!("[stress-loopback] === RESULTS ===");
-        eprintln!("[stress-loopback] elapsed:    {:.3}s", elapsed.as_secs_f64());
+        eprintln!(
+            "[stress-loopback] elapsed:    {:.3}s",
+            elapsed.as_secs_f64()
+        );
         eprintln!("[stress-loopback] sent:       {}", sent);
         eprintln!("[stress-loopback] received:   {}", received);
         eprintln!("[stress-loopback] matched:    {}", matched);
         eprintln!("[stress-loopback] mismatched: {}", mismatched);
         eprintln!("[stress-loopback] lost:       {}", lost);
-        eprintln!("[stress-loopback] bus_frames: {} (non-loopback traffic seen)", bus_frames);
+        eprintln!(
+            "[stress-loopback] bus_frames: {} (non-loopback traffic seen)",
+            bus_frames
+        );
         if sent > 0 {
             eprintln!(
                 "[stress-loopback] success:   {:.1}%",
@@ -855,7 +946,9 @@ mod app {
         let prefix = match ts_mode {
             TimestampMode::None => String::new(),
             TimestampMode::Delta => format!("({:>12.6}) ", start_monotonic.elapsed().as_secs_f64()),
-            TimestampMode::Relative => format!("({:>12.6}) ", msg.timestamp_us as f64 / 1_000_000.0),
+            TimestampMode::Relative => {
+                format!("({:>12.6}) ", msg.timestamp_us as f64 / 1_000_000.0)
+            }
             TimestampMode::Absolute => {
                 let ts_us = start_epoch_us.saturating_add(msg.timestamp_us);
                 format!("({:>12.6}) ", ts_us as f64 / 1_000_000.0)

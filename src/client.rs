@@ -2,7 +2,10 @@
 //!
 //! Communicates with the j2534-bridge process via named pipes.
 
-use crate::protocol::{CanMessage, DeviceInfo, Message, RawIoResult, Request, Response, ResponseData, VersionInfo, BatchMessage};
+use crate::protocol::{
+    BatchMessage, CanMessage, DeviceInfo, Message, RawIoResult, Request, Response, ResponseData,
+    VersionInfo,
+};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -290,7 +293,11 @@ impl BridgeClient {
             format!(
                 "Failed to parse bridge response: {}. Raw: {:?}",
                 e,
-                if line.len() > 200 { &line[..200] } else { &line }
+                if line.len() > 200 {
+                    &line[..200]
+                } else {
+                    &line
+                }
             )
         })?;
 
@@ -335,7 +342,9 @@ impl BridgeClient {
     pub fn enumerate_devices(&mut self) -> Result<Vec<DeviceInfo>, String> {
         let response = self.send_request(Request::EnumerateDevices)?;
         match response {
-            Response::Ok { data: ResponseData::Devices(devices) } => Ok(devices),
+            Response::Ok {
+                data: ResponseData::Devices(devices),
+            } => Ok(devices),
             Response::Ok { .. } => Ok(Vec::new()),
             Response::Error { message, .. } => Err(message),
         }
@@ -385,7 +394,9 @@ impl BridgeClient {
             max_drain_reads,
         })?;
         match response {
-            Response::Ok { data: ResponseData::Messages(msgs) } => Ok(msgs),
+            Response::Ok {
+                data: ResponseData::Messages(msgs),
+            } => Ok(msgs),
             Response::Ok { .. } => Ok(Vec::new()),
             Response::Error { message, .. } => Err(message),
         }
@@ -397,20 +408,34 @@ impl BridgeClient {
     }
 
     /// Read messages including loopback echoes
-    pub fn read_messages_with_loopback(&mut self, timeout_ms: u32) -> Result<Vec<CanMessage>, String> {
+    pub fn read_messages_with_loopback(
+        &mut self,
+        timeout_ms: u32,
+    ) -> Result<Vec<CanMessage>, String> {
         let response = self.send_request(Request::ReadMessagesWithLoopback { timeout_ms })?;
         match response {
-            Response::Ok { data: ResponseData::Messages(msgs) } => Ok(msgs),
+            Response::Ok {
+                data: ResponseData::Messages(msgs),
+            } => Ok(msgs),
             Response::Ok { .. } => Ok(Vec::new()),
             Response::Error { message, .. } => Err(message),
         }
     }
 
     /// Read messages with raw result
-    pub fn read_messages_raw(&mut self, timeout_ms: u32, max_msgs: u32) -> Result<RawIoResult, String> {
-        let response = self.send_request(Request::ReadMessagesRaw { timeout_ms, max_msgs })?;
+    pub fn read_messages_raw(
+        &mut self,
+        timeout_ms: u32,
+        max_msgs: u32,
+    ) -> Result<RawIoResult, String> {
+        let response = self.send_request(Request::ReadMessagesRaw {
+            timeout_ms,
+            max_msgs,
+        })?;
         match response {
-            Response::Ok { data: ResponseData::RawIo(raw) } => Ok(raw),
+            Response::Ok {
+                data: ResponseData::RawIo(raw),
+            } => Ok(raw),
             Response::Ok { .. } => Err("Unexpected response type".to_string()),
             Response::Error { message, .. } => Err(message),
         }
@@ -430,15 +455,24 @@ impl BridgeClient {
     }
 
     /// Send multiple CAN messages in a batch
-    pub fn send_messages_batch(&mut self, messages: Vec<(u32, Vec<u8>, bool)>) -> Result<u32, String> {
+    pub fn send_messages_batch(
+        &mut self,
+        messages: Vec<(u32, Vec<u8>, bool)>,
+    ) -> Result<u32, String> {
         let batch: Vec<BatchMessage> = messages
             .into_iter()
-            .map(|(arb_id, data, extended)| BatchMessage { arb_id, data, extended })
+            .map(|(arb_id, data, extended)| BatchMessage {
+                arb_id,
+                data,
+                extended,
+            })
             .collect();
 
         let response = self.send_request(Request::SendMessagesBatch { messages: batch })?;
         match response {
-            Response::Ok { data: ResponseData::Number(n) } => Ok(n),
+            Response::Ok {
+                data: ResponseData::Number(n),
+            } => Ok(n),
             Response::Ok { .. } => Err("Unexpected response type".to_string()),
             Response::Error { message, .. } => Err(message),
         }
@@ -452,7 +486,11 @@ impl BridgeClient {
     ) -> Result<RawIoResult, String> {
         let batch: Vec<BatchMessage> = messages
             .into_iter()
-            .map(|(arb_id, data, extended)| BatchMessage { arb_id, data, extended })
+            .map(|(arb_id, data, extended)| BatchMessage {
+                arb_id,
+                data,
+                extended,
+            })
             .collect();
 
         let response = self.send_request(Request::WriteMessagesRaw {
@@ -460,7 +498,9 @@ impl BridgeClient {
             timeout_ms,
         })?;
         match response {
-            Response::Ok { data: ResponseData::RawIo(raw) } => Ok(raw),
+            Response::Ok {
+                data: ResponseData::RawIo(raw),
+            } => Ok(raw),
             Response::Ok { .. } => Err("Unexpected response type".to_string()),
             Response::Error { message, .. } => Err(message),
         }
@@ -479,7 +519,9 @@ impl BridgeClient {
     pub fn read_version(&mut self) -> Result<VersionInfo, String> {
         let response = self.send_request(Request::ReadVersion)?;
         match response {
-            Response::Ok { data: ResponseData::Version(v) } => Ok(v),
+            Response::Ok {
+                data: ResponseData::Version(v),
+            } => Ok(v),
             Response::Ok { .. } => Err("Unexpected response type".to_string()),
             Response::Error { message, .. } => Err(message),
         }
@@ -489,7 +531,9 @@ impl BridgeClient {
     pub fn get_last_error_string(&mut self) -> Result<String, String> {
         let response = self.send_request(Request::GetLastError)?;
         match response {
-            Response::Ok { data: ResponseData::String(s) } => Ok(s),
+            Response::Ok {
+                data: ResponseData::String(s),
+            } => Ok(s),
             Response::Ok { .. } => Ok(String::new()),
             Response::Error { message, .. } => Err(message),
         }
@@ -499,7 +543,9 @@ impl BridgeClient {
     pub fn read_battery_voltage(&mut self) -> Result<f64, String> {
         let response = self.send_request(Request::ReadBatteryVoltage)?;
         match response {
-            Response::Ok { data: ResponseData::Float(v) } => Ok(v),
+            Response::Ok {
+                data: ResponseData::Float(v),
+            } => Ok(v),
             Response::Ok { .. } => Err("Unexpected response type".to_string()),
             Response::Error { message, .. } => Err(message),
         }
@@ -509,7 +555,9 @@ impl BridgeClient {
     pub fn read_programming_voltage(&mut self) -> Result<f64, String> {
         let response = self.send_request(Request::ReadProgrammingVoltage)?;
         match response {
-            Response::Ok { data: ResponseData::Float(v) } => Ok(v),
+            Response::Ok {
+                data: ResponseData::Float(v),
+            } => Ok(v),
             Response::Ok { .. } => Err("Unexpected response type".to_string()),
             Response::Error { message, .. } => Err(message),
         }
@@ -520,7 +568,9 @@ impl BridgeClient {
             data: data.to_vec(),
         })?;
         match response {
-            Response::Ok { data: ResponseData::Messages(mut msgs) } => msgs
+            Response::Ok {
+                data: ResponseData::Messages(mut msgs),
+            } => msgs
                 .drain(..)
                 .next()
                 .ok_or_else(|| "No FAST_INIT response message returned".to_string()),
@@ -534,7 +584,9 @@ impl BridgeClient {
             data: data.to_vec(),
         })?;
         match response {
-            Response::Ok { data: ResponseData::Messages(mut msgs) } => msgs
+            Response::Ok {
+                data: ResponseData::Messages(mut msgs),
+            } => msgs
                 .drain(..)
                 .next()
                 .ok_or_else(|| "No FIVE_BAUD_INIT response message returned".to_string()),
@@ -581,7 +633,9 @@ impl BridgeClient {
             extended,
         })?;
         match response {
-            Response::Ok { data: ResponseData::Number(id) } => Ok(id),
+            Response::Ok {
+                data: ResponseData::Number(id),
+            } => Ok(id),
             Response::Ok { .. } => Err("Unexpected response type".to_string()),
             Response::Error { message, .. } => Err(message),
         }
@@ -626,7 +680,9 @@ impl BridgeClient {
             extended,
         })?;
         match response {
-            Response::Ok { data: ResponseData::Number(id) } => Ok(id),
+            Response::Ok {
+                data: ResponseData::Number(id),
+            } => Ok(id),
             Response::Ok { .. } => Err("Unexpected response type".to_string()),
             Response::Error { message, .. } => Err(message),
         }
@@ -653,7 +709,9 @@ impl BridgeClient {
             extended,
         })?;
         match response {
-            Response::Ok { data: ResponseData::Number(id) } => Ok(id),
+            Response::Ok {
+                data: ResponseData::Number(id),
+            } => Ok(id),
             Response::Ok { .. } => Err("Unexpected response type".to_string()),
             Response::Error { message, .. } => Err(message),
         }
@@ -681,7 +739,9 @@ impl BridgeClient {
     pub fn get_config(&mut self, parameter: u32) -> Result<u32, String> {
         let response = self.send_request(Request::GetConfig { parameter })?;
         match response {
-            Response::Ok { data: ResponseData::Number(v) } => Ok(v),
+            Response::Ok {
+                data: ResponseData::Number(v),
+            } => Ok(v),
             Response::Ok { .. } => Err("Unexpected response type".to_string()),
             Response::Error { message, .. } => Err(message),
         }
@@ -700,7 +760,9 @@ impl BridgeClient {
     pub fn get_loopback(&mut self) -> Result<bool, String> {
         let response = self.send_request(Request::GetLoopback)?;
         match response {
-            Response::Ok { data: ResponseData::Bool(v) } => Ok(v),
+            Response::Ok {
+                data: ResponseData::Bool(v),
+            } => Ok(v),
             Response::Ok { .. } => Err("Unexpected response type".to_string()),
             Response::Error { message, .. } => Err(message),
         }
@@ -719,7 +781,9 @@ impl BridgeClient {
     pub fn get_data_rate(&mut self) -> Result<u32, String> {
         let response = self.send_request(Request::GetDataRate)?;
         match response {
-            Response::Ok { data: ResponseData::Number(v) } => Ok(v),
+            Response::Ok {
+                data: ResponseData::Number(v),
+            } => Ok(v),
             Response::Ok { .. } => Err("Unexpected response type".to_string()),
             Response::Error { message, .. } => Err(message),
         }

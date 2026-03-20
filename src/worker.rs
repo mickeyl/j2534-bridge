@@ -132,13 +132,8 @@ fn worker_loop(
 ) {
     let config = WorkerConfig::from_env();
 
-    let conn = match J2534Connection::open(
-        &dll_path,
-        protocol_id,
-        baud_rate,
-        connect_flags,
-        |_| {},
-    ) {
+    let conn = match J2534Connection::open(&dll_path, protocol_id, baud_rate, connect_flags, |_| {})
+    {
         Ok(conn) => {
             let _ = startup_tx.send(Ok(()));
             conn
@@ -211,10 +206,7 @@ fn handle_worker_request(
             wait_for_messages(conn, rx_buffer, stats, config, timeout_ms);
             pump_frames(conn, rx_buffer, stats, config, 0);
             let messages = drain_buffer(rx_buffer, max_messages);
-            send_response(
-                response_tx,
-                Response::ok(ResponseData::Messages(messages)),
-            );
+            send_response(response_tx, Response::ok(ResponseData::Messages(messages)));
             true
         }
 
@@ -440,9 +432,7 @@ fn execute_direct_request(conn: &J2534Connection, request: Request) -> Response 
         | Request::Close
         | Request::Shutdown
         | Request::EnumerateDevices
-        | Request::Open { .. } => {
-            Response::error(-1, "Unsupported worker request dispatch")
-        }
+        | Request::Open { .. } => Response::error(-1, "Unsupported worker request dispatch"),
     }
 }
 
@@ -477,8 +467,11 @@ fn pump_frames(
     config: &WorkerConfig,
     timeout_ms: u32,
 ) {
-    match conn.read_messages_drain(timeout_ms, config.pump_batch_size, config.pump_max_drain_reads)
-    {
+    match conn.read_messages_drain(
+        timeout_ms,
+        config.pump_batch_size,
+        config.pump_max_drain_reads,
+    ) {
         Ok(messages) => push_messages(rx_buffer, stats, config.rx_capacity, map_messages(messages)),
         Err(err) => {
             if timeout_ms > 0 {
@@ -692,7 +685,12 @@ mod tests {
     fn push_messages_under_capacity() {
         let mut buffer = VecDeque::new();
         let mut stats = RxBufferStats::default();
-        push_messages(&mut buffer, &mut stats, 10, make_msgs(&[0x100, 0x200, 0x300]));
+        push_messages(
+            &mut buffer,
+            &mut stats,
+            10,
+            make_msgs(&[0x100, 0x200, 0x300]),
+        );
         assert_eq!(buffer.len(), 3);
         assert_eq!(stats.dropped_frames, 0);
         assert_eq!(stats.high_water_mark, 3);
@@ -703,7 +701,12 @@ mod tests {
         let mut buffer = VecDeque::new();
         let mut stats = RxBufferStats::default();
         // Fill to capacity
-        push_messages(&mut buffer, &mut stats, 3, make_msgs(&[0x100, 0x200, 0x300]));
+        push_messages(
+            &mut buffer,
+            &mut stats,
+            3,
+            make_msgs(&[0x100, 0x200, 0x300]),
+        );
         assert_eq!(buffer.len(), 3);
         assert_eq!(stats.dropped_frames, 0);
 
@@ -738,13 +741,23 @@ mod tests {
     fn push_messages_high_water_mark_tracks_peak() {
         let mut buffer = VecDeque::new();
         let mut stats = RxBufferStats::default();
-        push_messages(&mut buffer, &mut stats, 100, make_msgs(&[0x100, 0x200, 0x300]));
+        push_messages(
+            &mut buffer,
+            &mut stats,
+            100,
+            make_msgs(&[0x100, 0x200, 0x300]),
+        );
         assert_eq!(stats.high_water_mark, 3);
 
         // Drain some
         buffer.pop_front();
         // Push more — high water should update
-        push_messages(&mut buffer, &mut stats, 100, make_msgs(&[0x400, 0x500, 0x600]));
+        push_messages(
+            &mut buffer,
+            &mut stats,
+            100,
+            make_msgs(&[0x400, 0x500, 0x600]),
+        );
         assert_eq!(stats.high_water_mark, 5);
     }
 
@@ -836,7 +849,10 @@ mod tests {
 
         let config = WorkerConfig::from_env();
         assert_eq!(config.rx_capacity, DEFAULT_RX_CAPACITY);
-        assert_eq!(config.poll_interval, Duration::from_millis(DEFAULT_POLL_INTERVAL_MS));
+        assert_eq!(
+            config.poll_interval,
+            Duration::from_millis(DEFAULT_POLL_INTERVAL_MS)
+        );
         assert_eq!(config.pump_batch_size, DEFAULT_PUMP_BATCH_SIZE);
         assert_eq!(config.pump_max_drain_reads, DEFAULT_PUMP_MAX_DRAIN_READS);
     }
