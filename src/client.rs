@@ -136,6 +136,20 @@ impl BridgeClient {
                             .join(build_type)
                             .join("j2534-bridge.exe")
                     }),
+                // Git submodule at src-tauri/j2534-bridge/ (debug: target/debug/,
+                // cross-compiled: target/<triple>/debug/).  Walk up to the directory
+                // that *contains* `target/` and look for j2534-bridge/ there.
+                {
+                    let target_dir = exe_dir.parent(); // .../target
+                    let crate_root = target_dir.and_then(|p| p.parent()); // .../src-tauri
+                    crate_root.map(|p| {
+                        p.join("j2534-bridge")
+                            .join("target")
+                            .join(target_triple)
+                            .join(build_type)
+                            .join("j2534-bridge.exe")
+                    })
+                },
                 // Shared crate: ../j2534-bridge/target/...
                 exe_dir
                     .parent()
