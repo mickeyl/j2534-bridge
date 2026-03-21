@@ -69,6 +69,12 @@ impl BridgeClient {
             return Ok(bridge_path);
         }
 
+        // Try Tauri resource directory (NSIS installs place resources here)
+        let resource_path = exe_dir.join("resources").join(bridge_name);
+        if resource_path.exists() {
+            return Ok(resource_path);
+        }
+
         // In development, prefer the explicitly published bridge binaries.
         // This avoids accidentally launching an older cross-target artifact from target/.
         let dev_published_candidates = [
@@ -175,8 +181,8 @@ impl BridgeClient {
         }
 
         Err(format!(
-            "Bridge executable not found: {} (looked in {:?} and development paths)",
-            bridge_name, exe_dir
+            "Bridge executable not found: {} (looked in {:?}, {:?}/resources, and development paths)",
+            bridge_name, exe_dir, exe_dir
         ))
     }
 
