@@ -663,6 +663,14 @@ type PassThruOpenFn = unsafe extern "system" fn(*const c_void, *mut c_ulong) -> 
 type PassThruCloseFn = unsafe extern "system" fn(c_ulong) -> i32;
 type PassThruConnectFn =
     unsafe extern "system" fn(c_ulong, c_ulong, c_ulong, c_ulong, *mut c_ulong) -> i32;
+type PassThruConnectV0500Fn = unsafe extern "system" fn(
+    c_ulong,
+    c_ulong,
+    c_ulong,
+    c_ulong,
+    *const c_void,
+    *mut c_ulong,
+) -> i32;
 type PassThruDisconnectFn = unsafe extern "system" fn(c_ulong) -> i32;
 type PassThruReadMsgsFn =
     unsafe extern "system" fn(c_ulong, *mut PassThruMsg, *mut c_ulong, c_ulong) -> i32;
@@ -762,18 +770,35 @@ impl J2534Connection {
         let mut channel_id: c_ulong = 0;
         let flags = connect_flags;
 
-        unsafe {
-            let connect_fn: Symbol<PassThruConnectFn> = library
-                .get(b"PassThruConnect\0")
-                .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruConnect - {}", e))?;
+        // Detect v05.00 API (has PassThruScanForDevices) vs v04.04
+        let is_v0500 =
+            unsafe { library.get::<*const ()>(b"PassThruScanForDevices\0").is_ok() };
 
-            let result = connect_fn(
-                device_id,
-                protocol_id as c_ulong,
-                flags as c_ulong,
-                baud_rate as c_ulong,
-                &mut channel_id,
-            );
+        unsafe {
+            let result = if is_v0500 {
+                let connect_fn: Symbol<PassThruConnectV0500Fn> = library
+                    .get(b"PassThruConnect\0")
+                    .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruConnect - {}", e))?;
+                connect_fn(
+                    device_id,
+                    protocol_id as c_ulong,
+                    flags as c_ulong,
+                    baud_rate as c_ulong,
+                    std::ptr::null(),
+                    &mut channel_id,
+                )
+            } else {
+                let connect_fn: Symbol<PassThruConnectFn> = library
+                    .get(b"PassThruConnect\0")
+                    .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruConnect - {}", e))?;
+                connect_fn(
+                    device_id,
+                    protocol_id as c_ulong,
+                    flags as c_ulong,
+                    baud_rate as c_ulong,
+                    &mut channel_id,
+                )
+            };
             if result != STATUS_NOERROR {
                 // Clean up device on failure
                 let last_error = get_last_error_message(&library);
@@ -950,54 +975,72 @@ impl J2534Connection {
         // reliable way to capture extended frames.
         let channel_id_29bit = if connect_flags == CAN_ID_BOTH {
             let mut ch29: c_ulong = 0;
-            let connect_fn: Option<Symbol<PassThruConnectFn>> =
-                unsafe { library.get(b"PassThruConnect\0").ok() };
             let filter_fn_29: Option<Symbol<PassThruStartMsgFilterFn>> =
                 unsafe { library.get(b"PassThruStartMsgFilter\0").ok() };
 
-            let opened = match (connect_fn, filter_fn_29) {
-                (Some(cfn), Some(ffn)) => {
-                    let res = unsafe {
-                        cfn(
+            let opened = if let Some(ffn) = filter_fn_29 {
+                let res = if is_v0500 {
+                    let cfn: Option<Symbol<PassThruConnectV0500Fn>> =
+                        unsafe { library.get(b"PassThruConnect\0").ok() };
+                    cfn.map(|f| unsafe {
+                        f(
+                            device_id,
+                            protocol_id as c_ulong,
+                            CAN_29BIT_ID as c_ulong,
+                            baud_rate as c_ulong,
+                            std::ptr::null(),
+                            &mut ch29,
+                        )
+                    })
+                } else {
+                    let cfn: Option<Symbol<PassThruConnectFn>> =
+                        unsafe { library.get(b"PassThruConnect\0").ok() };
+                    cfn.map(|f| unsafe {
+                        f(
                             device_id,
                             protocol_id as c_ulong,
                             CAN_29BIT_ID as c_ulong,
                             baud_rate as c_ulong,
                             &mut ch29,
                         )
-                    };
-                    if res == STATUS_NOERROR {
-                        // Pass-all filter on the 29-bit channel
-                        let mut m = PassThruMsg::default();
-                        m.protocol_id = protocol_id;
-                        m.tx_flags = CAN_29BIT_ID;
-                        m.data_size = 4;
-                        let mut p = PassThruMsg::default();
-                        p.protocol_id = protocol_id;
-                        p.tx_flags = CAN_29BIT_ID;
-                        p.data_size = 4;
-                        let mut fid: c_ulong = 0;
-                        let fres =
-                            unsafe { ffn(ch29, PASS_FILTER, &m, &p, std::ptr::null(), &mut fid) };
-                        if fres != STATUS_NOERROR {
-                            eprintln!(
-                                "[j2534] 29-bit channel filter failed: {} ({})",
-                                fres,
-                                error_code_to_string(fres)
-                            );
-                        }
-                        eprintln!("[j2534] Opened dedicated 29-bit channel (id={})", ch29);
-                        Some(ch29)
-                    } else {
+                    })
+                };
+                let res = match res {
+                    Some(r) => r,
+                    None => -1,
+                };
+                if res == STATUS_NOERROR {
+                    // Pass-all filter on the 29-bit channel
+                    let mut m = PassThruMsg::default();
+                    m.protocol_id = protocol_id;
+                    m.tx_flags = CAN_29BIT_ID;
+                    m.data_size = 4;
+                    let mut p = PassThruMsg::default();
+                    p.protocol_id = protocol_id;
+                    p.tx_flags = CAN_29BIT_ID;
+                    p.data_size = 4;
+                    let mut fid: c_ulong = 0;
+                    let fres =
+                        unsafe { ffn(ch29, PASS_FILTER, &m, &p, std::ptr::null(), &mut fid) };
+                    if fres != STATUS_NOERROR {
                         eprintln!(
-                            "[j2534] Could not open 29-bit channel: {} ({}) — relying on CAN_ID_BOTH",
-                            res,
-                            error_code_to_string(res)
+                            "[j2534] 29-bit channel filter failed: {} ({})",
+                            fres,
+                            error_code_to_string(fres)
                         );
-                        None
                     }
+                    eprintln!("[j2534] Opened dedicated 29-bit channel (id={})", ch29);
+                    Some(ch29)
+                } else {
+                    eprintln!(
+                        "[j2534] Could not open 29-bit channel: {} ({}) — relying on CAN_ID_BOTH",
+                        res,
+                        error_code_to_string(res)
+                    );
+                    None
                 }
-                _ => None,
+            } else {
+                None
             };
             opened
         } else {
