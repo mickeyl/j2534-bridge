@@ -205,12 +205,15 @@ impl BridgeClient {
         );
         eprintln!("[J2534_DEBUG] j2534-client pipe={}", self.pipe_name);
 
-        // Start the bridge process
+        // Start the bridge process (hidden — no console window)
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
         let child = Command::new(&bridge_path)
             .arg(&self.pipe_name)
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
+            .creation_flags(CREATE_NO_WINDOW)
             .spawn()
             .map_err(|e| format!("Failed to start bridge: {}", e))?;
 
