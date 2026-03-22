@@ -49,7 +49,7 @@ impl BridgeClient {
     }
 
     /// Get the path to the bridge executable for the given bitness
-    fn get_bridge_path(bitness: u8) -> Result<std::path::PathBuf, String> {
+    pub fn get_bridge_path(bitness: u8) -> Result<std::path::PathBuf, String> {
         let exe_dir = std::env::current_exe()
             .map_err(|e| format!("Failed to get executable path: {}", e))?
             .parent()
