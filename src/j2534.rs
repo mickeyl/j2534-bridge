@@ -34,6 +34,7 @@ pub const CAN_29BIT_ID: u32 = 0x100;
 pub const ISO9141_NO_CHECKSUM: u32 = 0x200;
 #[allow(dead_code)]
 pub const CAN_ID_BOTH: u32 = 0x800;
+#[allow(dead_code)]
 pub const CAN_MIXED_CAPTURE_FLAGS: u32 = CAN_ID_BOTH | CAN_29BIT_ID;
 #[allow(dead_code)]
 pub const ISO9141_K_LINE_ONLY: u32 = 0x1000;
@@ -352,7 +353,9 @@ fn passthru_msg_to_can_message(msg: &PassThruMsg) -> CANMessage {
         CANMessage {
             timestamp_us: msg.timestamp as u64,
             arb_id,
-            extended: (msg.rx_status & RX_CAN_29BIT_ID) != 0,
+            // OBDX workaround: driver doesn't set RX_CAN_29BIT_ID flag,
+            // so fall back to inferring extended from the arb ID value.
+            extended: (msg.rx_status & RX_CAN_29BIT_ID) != 0 || arb_id > 0x7FF,
             data,
             raw_arb_id: arb_id,
             rx_status: msg.rx_status,
@@ -931,8 +934,7 @@ impl J2534Connection {
                 }
 
                 // Pass-all filter for 29-bit (extended) CAN IDs
-                // CAN_ID_BOTH requires separate filters per ID type
-                if (connect_flags & CAN_29BIT_ID) != 0 && connect_flags != CAN_MIXED_CAPTURE_FLAGS {
+                if (connect_flags & CAN_29BIT_ID) != 0 {
                     let mut mask_msg_ext = PassThruMsg::default();
                     mask_msg_ext.protocol_id = protocol_id;
                     mask_msg_ext.tx_flags = CAN_29BIT_ID;
@@ -942,6 +944,13 @@ impl J2534Connection {
                     pattern_msg_ext.protocol_id = protocol_id;
                     pattern_msg_ext.tx_flags = CAN_29BIT_ID;
                     pattern_msg_ext.data_size = 4;
+                    // OBDX workaround: firmware infers 11-bit vs 29-bit from
+                    // the filter pattern value. Pattern <= 0x7FF is treated as
+                    // 11-bit. Use a 29-bit ID with mask=0 (still matches all).
+                    pattern_msg_ext.data[0] = 0x10;
+                    pattern_msg_ext.data[1] = 0xDA;
+                    pattern_msg_ext.data[2] = 0xF1;
+                    pattern_msg_ext.data[3] = 0x10;
 
                     let mut filter_id_ext: c_ulong = 0;
                     let result = filter_fn(
@@ -1019,6 +1028,11 @@ impl J2534Connection {
                     p.protocol_id = protocol_id;
                     p.tx_flags = CAN_29BIT_ID;
                     p.data_size = 4;
+                    // OBDX workaround: pattern > 0x7FF hints 29-bit mode
+                    p.data[0] = 0x10;
+                    p.data[1] = 0xDA;
+                    p.data[2] = 0xF1;
+                    p.data[3] = 0x10;
                     let mut fid: c_ulong = 0;
                     let fres =
                         unsafe { ffn(ch29, PASS_FILTER, &m, &p, std::ptr::null(), &mut fid) };
@@ -1420,7 +1434,7 @@ impl J2534Connection {
 
                 let data_len = (msg.data_size - 4) as usize;
                 let data = msg.data[4..4 + data_len].to_vec();
-                let extended = (msg.rx_status & RX_CAN_29BIT_ID) != 0;
+                let extended = (msg.rx_status & RX_CAN_29BIT_ID) != 0 || arb_id > 0x7FF;
 
                 // Driver workaround: filter out TX echoes by matching against recently sent messages
                 let is_tx_echo = if include_loopback {
@@ -1551,7 +1565,7 @@ impl J2534Connection {
                         u32::from_be_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
                     let data_len = (msg.data_size - 4) as usize;
                     let data = msg.data[4..4 + data_len].to_vec();
-                    let extended = (msg.rx_status & RX_CAN_29BIT_ID) != 0;
+                    let extended = (msg.rx_status & RX_CAN_29BIT_ID) != 0 || arb_id > 0x7FF;
 
                     // Driver workaround: filter TX echoes by matching sent_messages
                     let is_echo = if let Ok(mut sent) = self.sent_messages.lock() {

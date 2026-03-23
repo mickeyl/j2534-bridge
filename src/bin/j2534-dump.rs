@@ -23,10 +23,13 @@ mod app {
     const CAN_ID_BOTH: u32 = 0x800;
     const CAN_MIXED_CAPTURE_FLAGS: u32 = CAN_ID_BOTH | CAN_29BIT_ID;
     const ISO9141_NO_CHECKSUM: u32 = 0x200;
+    #[allow(dead_code)]
     const ISO9141_K_LINE_ONLY: u32 = 0x1000;
     const PROTOCOL_ISO9141: u32 = 3;
     const PROTOCOL_ISO14230: u32 = 4;
+    #[allow(dead_code)]
     const PROTOCOL_CAN: u32 = 5;
+    #[allow(dead_code)]
     const PROTOCOL_ISO15765: u32 = 6;
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
