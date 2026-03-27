@@ -38,7 +38,7 @@ endif
 
 DUMP = $(CARGO) run --bin j2534-dump -- $(SELECTOR) $(BITNESS_ARG) --baud-rate $(BAUD) --timeout-ms $(TIMEOUT_MS) --batch-size $(BATCH_SIZE) --max-drain-reads $(MAX_DRAIN_READS) --interface $(INTERFACE)
 
-.PHONY: help test build ensure-bridge ensure-bridge-dev publish-dev list dump dump-std dump-ext dump-both dump-loopback dump-stress-loopback dump-raw dump-isotp
+.PHONY: help test build ensure-bridge ensure-bridge-dev publish-dev list dump dump-std dump-ext dump-both dump-loopback dump-stress-loopback dump-raw dump-isotp native-build native-list native-rx native-rx-hybrid native-rx-v5-6param native-rx-nofilter
 
 help:
 	@echo "j2534-bridge test presets"
@@ -55,6 +55,12 @@ help:
 	@echo "  make test                  Run unit tests (protocol + worker)"
 	@echo "  make list"
 	@echo "  make ensure-bridge-dev     Build and publish fresh dev bridge binaries for CANcorder"
+	@echo "  make native-build          Build standalone C J2534 v5.0 test harness"
+	@echo "  make native-list           Enumerate devices through the native C harness"
+	@echo "  make native-rx             Native C CAN RX test (v5 connect + v5 filter)"
+	@echo "  make native-rx-hybrid      v5 connect + v4.04 filter/read (Rust bridge path)"
+	@echo "  make native-rx-v5-6param   v5 connect + 6-param filter w/ v5 struct"
+	@echo "  make native-rx-nofilter    v5 connect + skip filter (test default pass-through)"
 	@echo "  make dump DEVICE='My Adapter'"
 	@echo "  make dump-std DEVICE='My Adapter'"
 	@echo "  make dump-ext DEVICE='My Adapter'"
@@ -83,6 +89,24 @@ list: ensure-bridge
 
 build:
 	$(CARGO) build $(BUILD_TARGET) --bin j2534-bridge --bin j2534-dump
+
+native-build:
+	powershell -ExecutionPolicy Bypass -File .\scripts\build-native-j2534-test.ps1 -Arch x64
+
+native-list: native-build
+	.\target\native\x64\j2534_v5_can_test.exe list
+
+native-rx: native-build
+	.\target\native\x64\j2534_v5_can_test.exe can-rx --open-name "J2534-2:PEAK 0x51" --baud $(BAUD) --duration $(DURATION) --timeout-ms $(TIMEOUT_MS)
+
+native-rx-hybrid: native-build
+	.\target\native\x64\j2534_v5_can_test.exe can-rx-hybrid --open-name "J2534-2:PEAK 0x51" --baud $(BAUD) --duration $(DURATION) --timeout-ms $(TIMEOUT_MS)
+
+native-rx-v5-6param: native-build
+	.\target\native\x64\j2534_v5_can_test.exe can-rx-v5-6param --open-name "J2534-2:PEAK 0x51" --baud $(BAUD) --duration $(DURATION) --timeout-ms $(TIMEOUT_MS)
+
+native-rx-nofilter: native-build
+	.\target\native\x64\j2534_v5_can_test.exe can-rx --open-name "J2534-2:PEAK 0x51" --baud $(BAUD) --duration $(DURATION) --timeout-ms $(TIMEOUT_MS) --skip-filter
 
 dump: ensure-bridge
 	$(DUMP) --connect-mode both --clear-buffers --show-version --show-state --ascii --duration-secs $(DURATION) $(EXTRA)

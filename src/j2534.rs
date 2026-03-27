@@ -252,6 +252,8 @@ pub fn protocol_id_to_string(id: u32) -> &'static str {
     }
 }
 
+// --- v04.04 message layout (inline data[4128]) ---
+
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct PassThruMsg {
@@ -274,6 +276,76 @@ impl Default for PassThruMsg {
             data_size: 0,
             extra_data_index: 0,
             data: [0u8; 4128],
+        }
+    }
+}
+
+// --- v05.00 message layout (pointer-based DataBuffer, extra MsgHandle) ---
+// packed(1) to match J2534-2 / SAE spec layout.  Without packing, Rust (like
+// MSVC x64) inserts 4 bytes of padding before `data_buffer` (offset 32 instead
+// of 28), which crashes DLLs compiled with the packed layout (e.g. PEAK).
+
+#[repr(C, packed)]
+pub struct PassThruMsgV0500 {
+    pub protocol_id: u32,
+    pub msg_handle: u32,
+    pub rx_status: u32,
+    pub tx_flags: u32,
+    pub timestamp: u32,
+    pub data_length: u32,
+    pub extra_data_index: u32,
+    pub data_buffer: *mut u8,
+    pub data_buffer_size: u32,
+}
+
+impl PassThruMsgV0500 {
+    /// Create a zeroed v05.00 message backed by the given buffer slice.
+    /// Uses MaybeUninit + zeroed to guarantee padding bytes are zero.
+    fn new(buf: &mut [u8]) -> Self {
+        for b in buf.iter_mut() {
+            *b = 0;
+        }
+        let mut msg: Self = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+        msg.data_buffer = buf.as_mut_ptr();
+        msg.data_buffer_size = buf.len() as u32;
+        msg
+    }
+
+    /// Convert to the common CANMessage representation (same logic as v04.04 path).
+    fn to_can_message(&self, is_can: bool) -> Option<CANMessage> {
+        if is_can {
+            if self.data_length < 4 || self.data_buffer.is_null() {
+                return None;
+            }
+            let buf = unsafe { std::slice::from_raw_parts(self.data_buffer, self.data_length as usize) };
+            let arb_id = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+            let data = buf[4..].to_vec();
+            let extended = (self.rx_status & RX_CAN_29BIT_ID) != 0 || arb_id > 0x7FF;
+            Some(CANMessage {
+                timestamp_us: self.timestamp as u64,
+                arb_id,
+                extended,
+                data,
+                raw_arb_id: arb_id,
+                rx_status: self.rx_status,
+                data_size: self.data_length,
+                protocol_id: self.protocol_id,
+            })
+        } else {
+            if self.data_length == 0 || self.data_buffer.is_null() {
+                return None;
+            }
+            let buf = unsafe { std::slice::from_raw_parts(self.data_buffer, self.data_length as usize) };
+            Some(CANMessage {
+                timestamp_us: self.timestamp as u64,
+                arb_id: 0,
+                extended: false,
+                data: buf.to_vec(),
+                raw_arb_id: 0,
+                rx_status: self.rx_status,
+                data_size: self.data_length,
+                protocol_id: self.protocol_id,
+            })
         }
     }
 }
@@ -661,17 +733,39 @@ pub fn enumerate_devices() -> Vec<J2534Device> {
     devices
 }
 
+// J2534 v05.00 RESOURCE_STRUCT — passed by value to PassThruConnect.
+// ResourceListPtr is a flat array of pin numbers (e.g. [6, 14] for CAN on J1962).
+#[repr(C)]
+struct ResourceStruct {
+    connector: c_ulong,
+    num_of_resources: c_ulong,
+    resource_list_ptr: *const c_ulong,
+}
+
+const J1962_CONNECTOR: c_ulong = 1;
+
+/// Build a RESOURCE_STRUCT for CAN on the standard J1962 OBD-II connector
+/// (CAN_H = pin 6, CAN_L = pin 14).
+fn can_j1962_resource(pin_buf: &[c_ulong; 2]) -> ResourceStruct {
+    ResourceStruct {
+        connector: J1962_CONNECTOR,
+        num_of_resources: 2,
+        resource_list_ptr: pin_buf.as_ptr(),
+    }
+}
+
 // Use "system" calling convention which is stdcall on Windows and C on other platforms
 type PassThruOpenFn = unsafe extern "system" fn(*const c_void, *mut c_ulong) -> i32;
 type PassThruCloseFn = unsafe extern "system" fn(c_ulong) -> i32;
 type PassThruConnectFn =
     unsafe extern "system" fn(c_ulong, c_ulong, c_ulong, c_ulong, *mut c_ulong) -> i32;
+// v05.00 PassThruConnect adds a RESOURCE_STRUCT parameter (6 params).
 type PassThruConnectV0500Fn = unsafe extern "system" fn(
     c_ulong,
     c_ulong,
     c_ulong,
     c_ulong,
-    *const c_void,
+    ResourceStruct,
     *mut c_ulong,
 ) -> i32;
 type PassThruDisconnectFn = unsafe extern "system" fn(c_ulong) -> i32;
@@ -698,6 +792,24 @@ type PassThruGetLastErrorFn = unsafe extern "system" fn(*mut c_char) -> i32;
 #[allow(dead_code)]
 type PassThruSetProgrammingVoltageFn = unsafe extern "system" fn(c_ulong, c_ulong, c_ulong) -> i32;
 
+// v05.00 function signatures — message struct layout differs; filter drops flow-control param;
+// write is renamed to QueueMsgs.
+type PassThruStartMsgFilterV0500Fn = unsafe extern "system" fn(
+    c_ulong,
+    c_ulong,
+    *const PassThruMsgV0500,
+    *const PassThruMsgV0500,
+    *mut c_ulong,
+) -> i32;
+type PassThruReadMsgsV0500Fn =
+    unsafe extern "system" fn(c_ulong, *mut PassThruMsgV0500, *mut c_ulong, c_ulong) -> i32;
+type PassThruQueueMsgsFn =
+    unsafe extern "system" fn(c_ulong, *mut PassThruMsgV0500, *mut c_ulong, c_ulong) -> i32;
+type PassThruWriteMsgsV0500Fn =
+    unsafe extern "system" fn(c_ulong, *mut PassThruMsgV0500, *mut c_ulong, c_ulong) -> i32;
+type PassThruStartPeriodicMsgV0500Fn =
+    unsafe extern "system" fn(c_ulong, *const PassThruMsgV0500, *mut c_ulong, c_ulong) -> i32;
+
 pub struct J2534Connection {
     library: Library,
     device_id: u32,
@@ -706,6 +818,9 @@ pub struct J2534Connection {
     /// not supported by the adapter — we fall back to dual channels).
     channel_id_29bit: Option<u32>,
     protocol_id: u32,
+    /// True when the DLL exports v05.00 symbols (PassThruScanForDevices).
+    /// Controls which message struct and calling conventions are used.
+    is_v0500: bool,
     /// Recently sent messages for filtering TX echoes (driver workaround)
     sent_messages: Mutex<Vec<SentMessage>>,
 }
@@ -773,10 +888,15 @@ impl J2534Connection {
         let mut channel_id: c_ulong = 0;
         let flags = connect_flags;
 
-        // Detect v05.00 API (has PassThruScanForDevices) vs v04.04
+        // Detect v05.00 API (has PassThruScanForDevices) vs v04.04.
+        // v05.00 PassThruConnect adds a RESOURCE_STRUCT parameter.
+        // Detect v05.00 API (has PassThruScanForDevices) vs v04.04.
+        // v05.00 uses different message struct (pointer-based DataBuffer), different
+        // filter signature (5-param, no flow control), and renames WriteMsgs to QueueMsgs.
         let is_v0500 =
             unsafe { library.get::<*const ()>(b"PassThruScanForDevices\0").is_ok() };
 
+        let can_pins: [c_ulong; 2] = [6, 14]; // CAN_H, CAN_L on J1962
         unsafe {
             let result = if is_v0500 {
                 let connect_fn: Symbol<PassThruConnectV0500Fn> = library
@@ -787,7 +907,7 @@ impl J2534Connection {
                     protocol_id as c_ulong,
                     flags as c_ulong,
                     baud_rate as c_ulong,
-                    std::ptr::null(),
+                    can_j1962_resource(&can_pins),
                     &mut channel_id,
                 )
             } else {
@@ -853,25 +973,15 @@ impl J2534Connection {
                     library.get(b"PassThruStartMsgFilter\0").map_err(|e| {
                         format!("ERR_J2534_FUNC_NOT_FOUND: PassThruStartMsgFilter - {}", e)
                     })?;
-
-                // Pass-all filter for K-Line: 1-byte mask=0x00, pattern=0x00
                 let mut mask_msg = PassThruMsg::default();
                 mask_msg.protocol_id = protocol_id;
                 mask_msg.data_size = 1;
-                // data[0] already 0 = match everything
-
                 let mut pattern_msg = PassThruMsg::default();
                 pattern_msg.protocol_id = protocol_id;
                 pattern_msg.data_size = 1;
-
                 let mut filter_id: c_ulong = 0;
                 let result = filter_fn(
-                    channel_id,
-                    PASS_FILTER,
-                    &mask_msg,
-                    &pattern_msg,
-                    std::ptr::null(),
-                    &mut filter_id,
+                    channel_id, PASS_FILTER, &mask_msg, &pattern_msg, std::ptr::null(), &mut filter_id,
                 );
                 if result != STATUS_NOERROR {
                     eprintln!(
@@ -890,34 +1000,29 @@ impl J2534Connection {
         }
 
         if is_can_protocol {
-            unsafe {
-                let filter_fn: Symbol<PassThruStartMsgFilterFn> =
-                    library.get(b"PassThruStartMsgFilter\0").map_err(|e| {
-                        format!("ERR_J2534_FUNC_NOT_FOUND: PassThruStartMsgFilter - {}", e)
-                    })?;
-
-                // Pass-all filter for 11-bit (standard) CAN IDs
-                let mut mask_msg = PassThruMsg::default();
-                mask_msg.protocol_id = protocol_id;
-                mask_msg.data_size = 4;
-                // All zeros = match everything
-
-                let mut pattern_msg = PassThruMsg::default();
-                pattern_msg.protocol_id = protocol_id;
-                pattern_msg.data_size = 4;
-                // All zeros = match everything
-
-                let mut filter_id: c_ulong = 0;
-                let result = filter_fn(
+            let filter_result = if is_v0500 {
+                Self::install_filter_v0500(
+                    &library,
                     channel_id,
                     PASS_FILTER,
-                    &mask_msg,
-                    &pattern_msg,
-                    std::ptr::null(),
-                    &mut filter_id,
-                );
-                if result != STATUS_NOERROR {
-                    // Clean up on failure
+                    protocol_id,
+                    &[0u8; 4],
+                    &[0u8; 4],
+                    0,
+                )
+            } else {
+                Self::install_filter_v0404(
+                    &library,
+                    channel_id,
+                    PASS_FILTER,
+                    protocol_id,
+                    &[0u8; 4],
+                    &[0u8; 4],
+                    0,
+                )
+            };
+            if let Err(e) = filter_result {
+                unsafe {
                     if let Ok(disconnect_fn) =
                         library.get::<PassThruDisconnectFn>(b"PassThruDisconnect\0")
                     {
@@ -926,48 +1031,38 @@ impl J2534Connection {
                     if let Ok(close_fn) = library.get::<PassThruCloseFn>(b"PassThruClose\0") {
                         close_fn(device_id);
                     }
-                    return Err(format!(
-                        "ERR_J2534_FILTER_FAILED: error code {} ({})",
-                        result,
-                        error_code_to_string(result)
-                    ));
                 }
+                return Err(e);
+            }
 
-                // Pass-all filter for 29-bit (extended) CAN IDs
-                if (connect_flags & CAN_29BIT_ID) != 0 {
-                    let mut mask_msg_ext = PassThruMsg::default();
-                    mask_msg_ext.protocol_id = protocol_id;
-                    mask_msg_ext.tx_flags = CAN_29BIT_ID;
-                    mask_msg_ext.data_size = 4;
-
-                    let mut pattern_msg_ext = PassThruMsg::default();
-                    pattern_msg_ext.protocol_id = protocol_id;
-                    pattern_msg_ext.tx_flags = CAN_29BIT_ID;
-                    pattern_msg_ext.data_size = 4;
-                    // OBDX workaround: firmware infers 11-bit vs 29-bit from
-                    // the filter pattern value. Pattern <= 0x7FF is treated as
-                    // 11-bit. Use a 29-bit ID with mask=0 (still matches all).
-                    pattern_msg_ext.data[0] = 0x10;
-                    pattern_msg_ext.data[1] = 0xDA;
-                    pattern_msg_ext.data[2] = 0xF1;
-                    pattern_msg_ext.data[3] = 0x10;
-
-                    let mut filter_id_ext: c_ulong = 0;
-                    let result = filter_fn(
+            // Pass-all filter for 29-bit (extended) CAN IDs
+            if (connect_flags & CAN_29BIT_ID) != 0 {
+                let ext_result = if is_v0500 {
+                    Self::install_filter_v0500(
+                        &library,
                         channel_id,
                         PASS_FILTER,
-                        &mask_msg_ext,
-                        &pattern_msg_ext,
-                        std::ptr::null(),
-                        &mut filter_id_ext,
+                        protocol_id,
+                        &[0u8; 4],
+                        &[0x10, 0xDA, 0xF1, 0x10],
+                        CAN_29BIT_ID,
+                    )
+                } else {
+                    Self::install_filter_v0404(
+                        &library,
+                        channel_id,
+                        PASS_FILTER,
+                        protocol_id,
+                        &[0u8; 4],
+                        &[0x10, 0xDA, 0xF1, 0x10],
+                        CAN_29BIT_ID,
+                    )
+                };
+                if let Err(e) = ext_result {
+                    eprintln!(
+                        "[j2534] Warning: 29-bit pass filter failed: {}. Extended frames may not be received.",
+                        e
                     );
-                    if result != STATUS_NOERROR {
-                        eprintln!(
-                            "[j2534] Warning: 29-bit pass filter failed: {} ({}). Extended frames may not be received.",
-                            result,
-                            error_code_to_string(result)
-                        );
-                    }
                 }
             }
 
@@ -984,79 +1079,63 @@ impl J2534Connection {
         // reliable way to capture extended frames.
         let channel_id_29bit = if connect_flags == CAN_ID_BOTH {
             let mut ch29: c_ulong = 0;
-            let filter_fn_29: Option<Symbol<PassThruStartMsgFilterFn>> =
-                unsafe { library.get(b"PassThruStartMsgFilter\0").ok() };
-
-            let opened = if let Some(ffn) = filter_fn_29 {
-                let res = if is_v0500 {
-                    let cfn: Option<Symbol<PassThruConnectV0500Fn>> =
-                        unsafe { library.get(b"PassThruConnect\0").ok() };
-                    cfn.map(|f| unsafe {
-                        f(
-                            device_id,
-                            protocol_id as c_ulong,
-                            CAN_29BIT_ID as c_ulong,
-                            baud_rate as c_ulong,
-                            std::ptr::null(),
-                            &mut ch29,
-                        )
-                    })
-                } else {
-                    let cfn: Option<Symbol<PassThruConnectFn>> =
-                        unsafe { library.get(b"PassThruConnect\0").ok() };
-                    cfn.map(|f| unsafe {
-                        f(
-                            device_id,
-                            protocol_id as c_ulong,
-                            CAN_29BIT_ID as c_ulong,
-                            baud_rate as c_ulong,
-                            &mut ch29,
-                        )
-                    })
-                };
-                let res = match res {
-                    Some(r) => r,
-                    None => -1,
-                };
-                if res == STATUS_NOERROR {
+            let can_pins_29: [c_ulong; 2] = [6, 14];
+            let res = if is_v0500 {
+                let cfn: Option<Symbol<PassThruConnectV0500Fn>> =
+                    unsafe { library.get(b"PassThruConnect\0").ok() };
+                cfn.map(|f| unsafe {
+                    f(
+                        device_id,
+                        protocol_id as c_ulong,
+                        CAN_29BIT_ID as c_ulong,
+                        baud_rate as c_ulong,
+                        can_j1962_resource(&can_pins_29),
+                        &mut ch29,
+                    )
+                })
+            } else {
+                let cfn: Option<Symbol<PassThruConnectFn>> =
+                    unsafe { library.get(b"PassThruConnect\0").ok() };
+                cfn.map(|f| unsafe {
+                    f(
+                        device_id,
+                        protocol_id as c_ulong,
+                        CAN_29BIT_ID as c_ulong,
+                        baud_rate as c_ulong,
+                        &mut ch29,
+                    )
+                })
+            };
+            match res {
+                Some(r) if r == STATUS_NOERROR => {
                     // Pass-all filter on the 29-bit channel
-                    let mut m = PassThruMsg::default();
-                    m.protocol_id = protocol_id;
-                    m.tx_flags = CAN_29BIT_ID;
-                    m.data_size = 4;
-                    let mut p = PassThruMsg::default();
-                    p.protocol_id = protocol_id;
-                    p.tx_flags = CAN_29BIT_ID;
-                    p.data_size = 4;
-                    // OBDX workaround: pattern > 0x7FF hints 29-bit mode
-                    p.data[0] = 0x10;
-                    p.data[1] = 0xDA;
-                    p.data[2] = 0xF1;
-                    p.data[3] = 0x10;
-                    let mut fid: c_ulong = 0;
-                    let fres =
-                        unsafe { ffn(ch29, PASS_FILTER, &m, &p, std::ptr::null(), &mut fid) };
-                    if fres != STATUS_NOERROR {
-                        eprintln!(
-                            "[j2534] 29-bit channel filter failed: {} ({})",
-                            fres,
-                            error_code_to_string(fres)
-                        );
+                    let fres = if is_v0500 {
+                        Self::install_filter_v0500(
+                            &library, ch29, PASS_FILTER, protocol_id,
+                            &[0u8; 4], &[0x10, 0xDA, 0xF1, 0x10], CAN_29BIT_ID,
+                        )
+                    } else {
+                        Self::install_filter_v0404(
+                            &library, ch29, PASS_FILTER, protocol_id,
+                            &[0u8; 4], &[0x10, 0xDA, 0xF1, 0x10], CAN_29BIT_ID,
+                        )
+                    };
+                    if let Err(e) = fres {
+                        eprintln!("[j2534] 29-bit channel filter failed: {}", e);
                     }
                     eprintln!("[j2534] Opened dedicated 29-bit channel (id={})", ch29);
                     Some(ch29)
-                } else {
+                }
+                Some(r) => {
                     eprintln!(
                         "[j2534] Could not open 29-bit channel: {} ({}) — relying on CAN_ID_BOTH",
-                        res,
-                        error_code_to_string(res)
+                        r,
+                        error_code_to_string(r)
                     );
                     None
                 }
-            } else {
-                None
-            };
-            opened
+                None => None,
+            }
         } else {
             None
         };
@@ -1068,6 +1147,7 @@ impl J2534Connection {
             channel_id,
             channel_id_29bit,
             protocol_id,
+            is_v0500,
             sent_messages: Mutex::new(Vec::new()),
         };
 
@@ -1077,8 +1157,19 @@ impl J2534Connection {
             message: Some("Disabling loopback (if supported)".to_string()),
         });
 
-        let set_result = conn.set_loopback(false);
-        let readback = conn.get_loopback();
+        // v05.00 IOCTLs (GET_CONFIG/SET_CONFIG) crash on some DLLs (e.g. PEAK)
+        // due to struct layout expectations we haven't fully mapped yet.
+        // Skip loopback configuration for v05.00 — it's best-effort anyway.
+        let set_result = if is_v0500 {
+            Err("skipped (v0500 IOCTL not yet supported)".to_string())
+        } else {
+            conn.set_loopback(false)
+        };
+        let readback = if is_v0500 {
+            Err("skipped (v0500 IOCTL not yet supported)".to_string())
+        } else {
+            conn.get_loopback()
+        };
         let message = match (set_result, readback) {
             (Ok(()), Ok(state)) => Some(format!(
                 "Loopback reported {}",
@@ -1111,44 +1202,211 @@ impl J2534Connection {
         Ok(conn)
     }
 
-    pub fn send_message(&self, arb_id: u32, data: &[u8], extended: bool) -> Result<(), String> {
-        let mut msg = PassThruMsg::default();
-        msg.protocol_id = self.protocol_id;
-        let is_can = self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765;
-        let data_len = if is_can {
-            msg.tx_flags = if extended { CAN_29BIT_ID } else { 0 };
-            msg.data[0] = ((arb_id >> 24) & 0xFF) as u8;
-            msg.data[1] = ((arb_id >> 16) & 0xFF) as u8;
-            msg.data[2] = ((arb_id >> 8) & 0xFF) as u8;
-            msg.data[3] = (arb_id & 0xFF) as u8;
+    // --- v04.04 / v05.00 dispatch helpers ---
 
-            let data_len = data.len().min(8);
-            msg.data[4..4 + data_len].copy_from_slice(&data[..data_len]);
-            msg.data_size = (4 + data_len) as u32;
-            data_len
-        } else {
-            msg.tx_flags = 0;
-            let data_len = data.len().min(msg.data.len());
-            msg.data[..data_len].copy_from_slice(&data[..data_len]);
-            msg.data_size = data_len as u32;
-            data_len
-        };
-
-        let mut num_msgs: c_ulong = 1;
-
+    /// Install a message filter using the v04.04 ABI (6 params, inline data[4128]).
+    fn install_filter_v0404(
+        library: &Library,
+        channel_id: c_ulong,
+        filter_type: u32,
+        protocol_id: u32,
+        mask: &[u8],
+        pattern: &[u8],
+        tx_flags: u32,
+    ) -> Result<u32, String> {
         unsafe {
-            let write_fn: Symbol<PassThruWriteMsgsFn> = self
-                .library
-                .get(b"PassThruWriteMsgs\0")
-                .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruWriteMsgs - {}", e))?;
+            let filter_fn: Symbol<PassThruStartMsgFilterFn> =
+                library.get(b"PassThruStartMsgFilter\0").map_err(|e| {
+                    format!("ERR_J2534_FUNC_NOT_FOUND: PassThruStartMsgFilter - {}", e)
+                })?;
+            let mut mask_msg = PassThruMsg::default();
+            mask_msg.protocol_id = protocol_id;
+            mask_msg.tx_flags = tx_flags;
+            let mask_len = mask.len().min(12);
+            mask_msg.data[..mask_len].copy_from_slice(&mask[..mask_len]);
+            mask_msg.data_size = mask_len as u32;
 
-            let result = write_fn(self.channel_id, &mut msg, &mut num_msgs, 1000);
+            let mut pattern_msg = PassThruMsg::default();
+            pattern_msg.protocol_id = protocol_id;
+            pattern_msg.tx_flags = tx_flags;
+            let pat_len = pattern.len().min(12);
+            pattern_msg.data[..pat_len].copy_from_slice(&pattern[..pat_len]);
+            pattern_msg.data_size = pat_len as u32;
+
+            let mut filter_id: c_ulong = 0;
+            let result = filter_fn(
+                channel_id,
+                filter_type,
+                &mask_msg,
+                &pattern_msg,
+                std::ptr::null(),
+                &mut filter_id,
+            );
+            if result != STATUS_NOERROR {
+                return Err(format!(
+                    "ERR_J2534_FILTER_FAILED: error code {} ({})",
+                    result,
+                    error_code_to_string(result)
+                ));
+            }
+            Ok(filter_id as u32)
+        }
+    }
+
+    /// Install a message filter using the v05.00 ABI (5 params, pointer-based DataBuffer).
+    fn install_filter_v0500(
+        library: &Library,
+        channel_id: c_ulong,
+        filter_type: u32,
+        protocol_id: u32,
+        mask: &[u8],
+        pattern: &[u8],
+        tx_flags: u32,
+    ) -> Result<u32, String> {
+        unsafe {
+            let filter_fn: Symbol<PassThruStartMsgFilterV0500Fn> =
+                library.get(b"PassThruStartMsgFilter\0").map_err(|e| {
+                    format!("ERR_J2534_FUNC_NOT_FOUND: PassThruStartMsgFilter - {}", e)
+                })?;
+            let mask_len = mask.len().min(4128);
+            let mut mask_buf = vec![0u8; mask_len];
+            mask_buf[..mask_len].copy_from_slice(&mask[..mask_len]);
+            let mut mask_msg = PassThruMsgV0500::new(&mut mask_buf);
+            mask_msg.protocol_id = protocol_id;
+            mask_msg.tx_flags = tx_flags;
+            mask_msg.data_length = mask_len as u32;
+            mask_msg.extra_data_index = mask_len as u32;
+
+            let pat_len = pattern.len().min(4128);
+            let mut pat_buf = vec![0u8; pat_len];
+            pat_buf[..pat_len].copy_from_slice(&pattern[..pat_len]);
+            let mut pat_msg = PassThruMsgV0500::new(&mut pat_buf);
+            pat_msg.protocol_id = protocol_id;
+            pat_msg.tx_flags = tx_flags;
+            pat_msg.data_length = pat_len as u32;
+            pat_msg.extra_data_index = pat_len as u32;
+
+            let mut filter_id: c_ulong = 0;
+            let result = filter_fn(
+                channel_id,
+                filter_type,
+                &mask_msg,
+                &pat_msg,
+                &mut filter_id,
+            );
+            if result != STATUS_NOERROR {
+                return Err(format!(
+                    "ERR_J2534_FILTER_FAILED: error code {} ({})",
+                    result,
+                    error_code_to_string(result)
+                ));
+            }
+            Ok(filter_id as u32)
+        }
+    }
+
+    /// Resolve the v05.00 write function.  Prefers `PassThruQueueMsgs` (v05.00 name)
+    /// and falls back to `PassThruWriteMsgs` with the v05.00 struct layout.
+    fn resolve_write_fn_v0500(library: &Library) -> Result<Symbol<'_, PassThruQueueMsgsFn>, String> {
+        unsafe {
+            library
+                .get::<PassThruQueueMsgsFn>(b"PassThruQueueMsgs\0")
+                .or_else(|_| library.get::<PassThruWriteMsgsV0500Fn>(b"PassThruWriteMsgs\0"))
+                .map_err(|e| {
+                    format!(
+                        "ERR_J2534_FUNC_NOT_FOUND: PassThruQueueMsgs/PassThruWriteMsgs - {}",
+                        e
+                    )
+                })
+        }
+    }
+
+    /// Build a v05.00 CAN message from arb_id + payload, backed by the given buffer.
+    fn build_v0500_can_msg(
+        buf: &mut Vec<u8>,
+        protocol_id: u32,
+        arb_id: u32,
+        data: &[u8],
+        extended: bool,
+    ) {
+        let is_can = protocol_id == PROTOCOL_CAN || protocol_id == PROTOCOL_ISO15765;
+        if is_can {
+            let data_len = data.len().min(8);
+            let total = 4 + data_len;
+            buf.clear();
+            buf.resize(total, 0);
+            buf[0] = ((arb_id >> 24) & 0xFF) as u8;
+            buf[1] = ((arb_id >> 16) & 0xFF) as u8;
+            buf[2] = ((arb_id >> 8) & 0xFF) as u8;
+            buf[3] = (arb_id & 0xFF) as u8;
+            buf[4..4 + data_len].copy_from_slice(&data[..data_len]);
+        } else {
+            let data_len = data.len().min(4128);
+            buf.clear();
+            buf.resize(data_len, 0);
+            buf[..data_len].copy_from_slice(&data[..data_len]);
+        }
+        // tx_flags and protocol_id are set on the PassThruMsgV0500 struct, not in the buffer.
+        let _ = (protocol_id, extended); // used by caller
+    }
+
+    pub fn send_message(&self, arb_id: u32, data: &[u8], extended: bool) -> Result<(), String> {
+        let is_can = self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765;
+        let data_len;
+
+        if self.is_v0500 {
+            let mut buf = Vec::with_capacity(12);
+            Self::build_v0500_can_msg(&mut buf, self.protocol_id, arb_id, data, extended);
+            data_len = if is_can { data.len().min(8) } else { buf.len() };
+            let mut msg = PassThruMsgV0500::new(&mut buf);
+            msg.protocol_id = self.protocol_id;
+            msg.tx_flags = if is_can && extended { CAN_29BIT_ID } else { 0 };
+            msg.data_length = buf.len() as u32;
+            msg.extra_data_index = buf.len() as u32;
+            let mut num_msgs: c_ulong = 1;
+            let write_fn = Self::resolve_write_fn_v0500(&self.library)?;
+            let result = unsafe { write_fn(self.channel_id, &mut msg, &mut num_msgs, 1000) };
             if result != STATUS_NOERROR {
                 return Err(format!(
                     "ERR_J2534_WRITE_FAILED: error code {} [{}]",
                     result,
                     error_code_to_string(result)
                 ));
+            }
+        } else {
+            let mut msg = PassThruMsg::default();
+            msg.protocol_id = self.protocol_id;
+            data_len = if is_can {
+                msg.tx_flags = if extended { CAN_29BIT_ID } else { 0 };
+                msg.data[0] = ((arb_id >> 24) & 0xFF) as u8;
+                msg.data[1] = ((arb_id >> 16) & 0xFF) as u8;
+                msg.data[2] = ((arb_id >> 8) & 0xFF) as u8;
+                msg.data[3] = (arb_id & 0xFF) as u8;
+                let dl = data.len().min(8);
+                msg.data[4..4 + dl].copy_from_slice(&data[..dl]);
+                msg.data_size = (4 + dl) as u32;
+                dl
+            } else {
+                msg.tx_flags = 0;
+                let dl = data.len().min(msg.data.len());
+                msg.data[..dl].copy_from_slice(&data[..dl]);
+                msg.data_size = dl as u32;
+                dl
+            };
+            let mut num_msgs: c_ulong = 1;
+            unsafe {
+                let write_fn: Symbol<PassThruWriteMsgsFn> = self
+                    .library
+                    .get(b"PassThruWriteMsgs\0")
+                    .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruWriteMsgs - {}", e))?;
+                let result = write_fn(self.channel_id, &mut msg, &mut num_msgs, 1000);
+                if result != STATUS_NOERROR {
+                    return Err(format!(
+                        "ERR_J2534_WRITE_FAILED: error code {} [{}]",
+                        result,
+                        error_code_to_string(result)
+                    ));
+                }
             }
         }
 
@@ -1177,59 +1435,103 @@ impl J2534Connection {
             return Ok(0);
         }
 
-        // Build array of PassThruMsg
-        let mut msg_buffer: Vec<PassThruMsg> = messages
-            .iter()
-            .map(|(arb_id, data, extended)| {
-                let mut msg = PassThruMsg::default();
-                msg.protocol_id = self.protocol_id;
-                let is_can =
-                    self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765;
-                if is_can {
-                    msg.tx_flags = if *extended { CAN_29BIT_ID } else { 0 };
-                    msg.data[0] = ((arb_id >> 24) & 0xFF) as u8;
-                    msg.data[1] = ((arb_id >> 16) & 0xFF) as u8;
-                    msg.data[2] = ((arb_id >> 8) & 0xFF) as u8;
-                    msg.data[3] = (arb_id & 0xFF) as u8;
+        let is_can = self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765;
+        let mut num_msgs: c_ulong = messages.len() as c_ulong;
 
-                    let data_len = data.len().min(8);
-                    msg.data[4..4 + data_len].copy_from_slice(&data[..data_len]);
-                    msg.data_size = (4 + data_len) as u32;
-                } else {
-                    msg.tx_flags = 0;
-                    let data_len = data.len().min(msg.data.len());
-                    msg.data[..data_len].copy_from_slice(&data[..data_len]);
-                    msg.data_size = data_len as u32;
+        if self.is_v0500 {
+            // v05.00 path: separate backing buffers + PassThruMsgV0500 structs
+            let mut backing_buffers: Vec<Vec<u8>> = messages
+                .iter()
+                .map(|(arb_id, data, extended)| {
+                    let mut buf = Vec::with_capacity(12);
+                    Self::build_v0500_can_msg(&mut buf, self.protocol_id, *arb_id, data, *extended);
+                    buf
+                })
+                .collect();
+
+            let mut msg_buffer: Vec<PassThruMsgV0500> = backing_buffers
+                .iter_mut()
+                .zip(messages.iter())
+                .map(|(buf, (_arb_id, _data, extended))| {
+                    let mut msg = PassThruMsgV0500::new(buf);
+                    msg.protocol_id = self.protocol_id;
+                    msg.data_length = buf.len() as u32;
+                    msg.extra_data_index = buf.len() as u32;
+                    msg.tx_flags = if is_can && *extended { CAN_29BIT_ID } else { 0 };
+                    msg
+                })
+                .collect();
+
+            unsafe {
+                let write_fn = Self::resolve_write_fn_v0500(&self.library)?;
+                let timeout = 5000u32.max(messages.len() as u32 * 10);
+                let result = write_fn(
+                    self.channel_id,
+                    msg_buffer.as_mut_ptr(),
+                    &mut num_msgs,
+                    timeout,
+                );
+                if result != STATUS_NOERROR {
+                    return Err(format!(
+                        "ERR_J2534_WRITE_FAILED: error code {} ({}), sent {}/{} messages",
+                        result,
+                        error_code_to_string(result),
+                        num_msgs,
+                        messages.len()
+                    ));
                 }
+            }
+        } else {
+            // v04.04 path: inline data in PassThruMsg
+            let mut msg_buffer: Vec<PassThruMsg> = messages
+                .iter()
+                .map(|(arb_id, data, extended)| {
+                    let mut msg = PassThruMsg::default();
+                    msg.protocol_id = self.protocol_id;
+                    if is_can {
+                        msg.tx_flags = if *extended { CAN_29BIT_ID } else { 0 };
+                        msg.data[0] = ((arb_id >> 24) & 0xFF) as u8;
+                        msg.data[1] = ((arb_id >> 16) & 0xFF) as u8;
+                        msg.data[2] = ((arb_id >> 8) & 0xFF) as u8;
+                        msg.data[3] = (arb_id & 0xFF) as u8;
 
-                msg
-            })
-            .collect();
+                        let data_len = data.len().min(8);
+                        msg.data[4..4 + data_len].copy_from_slice(&data[..data_len]);
+                        msg.data_size = (4 + data_len) as u32;
+                    } else {
+                        msg.tx_flags = 0;
+                        let data_len = data.len().min(msg.data.len());
+                        msg.data[..data_len].copy_from_slice(&data[..data_len]);
+                        msg.data_size = data_len as u32;
+                    }
 
-        let mut num_msgs: c_ulong = msg_buffer.len() as c_ulong;
+                    msg
+                })
+                .collect();
 
-        unsafe {
-            let write_fn: Symbol<PassThruWriteMsgsFn> = self
-                .library
-                .get(b"PassThruWriteMsgs\0")
-                .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruWriteMsgs - {}", e))?;
+            unsafe {
+                let write_fn: Symbol<PassThruWriteMsgsFn> = self
+                    .library
+                    .get(b"PassThruWriteMsgs\0")
+                    .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruWriteMsgs - {}", e))?;
 
-            // Use a longer timeout for batch sends
-            let timeout = 5000u32.max(messages.len() as u32 * 10);
-            let result = write_fn(
-                self.channel_id,
-                msg_buffer.as_mut_ptr(),
-                &mut num_msgs,
-                timeout,
-            );
-            if result != STATUS_NOERROR {
-                return Err(format!(
-                    "ERR_J2534_WRITE_FAILED: error code {} ({}), sent {}/{} messages",
-                    result,
-                    error_code_to_string(result),
-                    num_msgs,
-                    messages.len()
-                ));
+                // Use a longer timeout for batch sends
+                let timeout = 5000u32.max(messages.len() as u32 * 10);
+                let result = write_fn(
+                    self.channel_id,
+                    msg_buffer.as_mut_ptr(),
+                    &mut num_msgs,
+                    timeout,
+                );
+                if result != STATUS_NOERROR {
+                    return Err(format!(
+                        "ERR_J2534_WRITE_FAILED: error code {} ({}), sent {}/{} messages",
+                        result,
+                        error_code_to_string(result),
+                        num_msgs,
+                        messages.len()
+                    ));
+                }
             }
         }
 
@@ -1269,48 +1571,83 @@ impl J2534Connection {
             });
         }
 
-        let mut msg_buffer: Vec<PassThruMsg> = messages
-            .iter()
-            .map(|(arb_id, data, extended)| {
-                let mut msg = PassThruMsg::default();
-                msg.protocol_id = self.protocol_id;
-                let is_can =
-                    self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765;
-                if is_can {
-                    msg.tx_flags = if *extended { CAN_29BIT_ID } else { 0 };
-                    msg.data[0] = ((arb_id >> 24) & 0xFF) as u8;
-                    msg.data[1] = ((arb_id >> 16) & 0xFF) as u8;
-                    msg.data[2] = ((arb_id >> 8) & 0xFF) as u8;
-                    msg.data[3] = (arb_id & 0xFF) as u8;
+        let is_can = self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765;
+        let mut num_msgs: c_ulong = messages.len() as c_ulong;
 
-                    let data_len = data.len().min(8);
-                    msg.data[4..4 + data_len].copy_from_slice(&data[..data_len]);
-                    msg.data_size = (4 + data_len) as u32;
-                } else {
-                    msg.tx_flags = 0;
-                    let data_len = data.len().min(msg.data.len());
-                    msg.data[..data_len].copy_from_slice(&data[..data_len]);
-                    msg.data_size = data_len as u32;
-                }
+        let result = if self.is_v0500 {
+            // v05.00 path: separate backing buffers + PassThruMsgV0500 structs
+            let mut backing_buffers: Vec<Vec<u8>> = messages
+                .iter()
+                .map(|(arb_id, data, extended)| {
+                    let mut buf = Vec::with_capacity(12);
+                    Self::build_v0500_can_msg(&mut buf, self.protocol_id, *arb_id, data, *extended);
+                    buf
+                })
+                .collect();
 
-                msg
-            })
-            .collect();
+            let mut msg_buffer: Vec<PassThruMsgV0500> = backing_buffers
+                .iter_mut()
+                .zip(messages.iter())
+                .map(|(buf, (_arb_id, _data, extended))| {
+                    let mut msg = PassThruMsgV0500::new(buf);
+                    msg.protocol_id = self.protocol_id;
+                    msg.data_length = buf.len() as u32;
+                    msg.extra_data_index = buf.len() as u32;
+                    msg.tx_flags = if is_can && *extended { CAN_29BIT_ID } else { 0 };
+                    msg
+                })
+                .collect();
 
-        let mut num_msgs: c_ulong = msg_buffer.len() as c_ulong;
+            unsafe {
+                let write_fn = Self::resolve_write_fn_v0500(&self.library)?;
+                write_fn(
+                    self.channel_id,
+                    msg_buffer.as_mut_ptr(),
+                    &mut num_msgs,
+                    timeout_ms,
+                )
+            }
+        } else {
+            // v04.04 path: inline data in PassThruMsg
+            let mut msg_buffer: Vec<PassThruMsg> = messages
+                .iter()
+                .map(|(arb_id, data, extended)| {
+                    let mut msg = PassThruMsg::default();
+                    msg.protocol_id = self.protocol_id;
+                    if is_can {
+                        msg.tx_flags = if *extended { CAN_29BIT_ID } else { 0 };
+                        msg.data[0] = ((arb_id >> 24) & 0xFF) as u8;
+                        msg.data[1] = ((arb_id >> 16) & 0xFF) as u8;
+                        msg.data[2] = ((arb_id >> 8) & 0xFF) as u8;
+                        msg.data[3] = (arb_id & 0xFF) as u8;
 
-        let result = unsafe {
-            let write_fn: Symbol<PassThruWriteMsgsFn> = self
-                .library
-                .get(b"PassThruWriteMsgs\0")
-                .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruWriteMsgs - {}", e))?;
+                        let data_len = data.len().min(8);
+                        msg.data[4..4 + data_len].copy_from_slice(&data[..data_len]);
+                        msg.data_size = (4 + data_len) as u32;
+                    } else {
+                        msg.tx_flags = 0;
+                        let data_len = data.len().min(msg.data.len());
+                        msg.data[..data_len].copy_from_slice(&data[..data_len]);
+                        msg.data_size = data_len as u32;
+                    }
 
-            write_fn(
-                self.channel_id,
-                msg_buffer.as_mut_ptr(),
-                &mut num_msgs,
-                timeout_ms,
-            )
+                    msg
+                })
+                .collect();
+
+            unsafe {
+                let write_fn: Symbol<PassThruWriteMsgsFn> = self
+                    .library
+                    .get(b"PassThruWriteMsgs\0")
+                    .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruWriteMsgs - {}", e))?;
+
+                write_fn(
+                    self.channel_id,
+                    msg_buffer.as_mut_ptr(),
+                    &mut num_msgs,
+                    timeout_ms,
+                )
+            }
         };
 
         // Track sent messages for TX echo filtering (driver workaround)
@@ -1342,28 +1679,66 @@ impl J2534Connection {
     /// Read messages and return raw J2534 result info (no parsing)
     pub fn read_messages_raw(&self, timeout_ms: u32, max_msgs: u32) -> Result<RawIoResult, String> {
         let max_msgs = max_msgs.clamp(1, 64);
-        let mut msg_buffer: Vec<PassThruMsg> =
-            (0..max_msgs).map(|_| PassThruMsg::default()).collect();
-        let mut num_msgs: c_ulong = max_msgs as c_ulong;
 
-        let result = unsafe {
-            let read_fn: Symbol<PassThruReadMsgsFn> = self
-                .library
-                .get(b"PassThruReadMsgs\0")
-                .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruReadMsgs - {}", e))?;
+        if self.is_v0500 {
+            // v05.00: pointer-based DataBuffer — allocate backing buffers that outlive the msg array
+            let mut backing_bufs: Vec<Vec<u8>> = (0..max_msgs).map(|_| vec![0u8; 4128]).collect();
+            let mut msg_buffer: Vec<PassThruMsgV0500> = backing_bufs
+                .iter_mut()
+                .map(|buf| {
+                    let mut msg = PassThruMsgV0500::new(buf);
+                    msg.protocol_id = self.protocol_id;
+                    msg
+                })
+                .collect();
+            let mut num_msgs: c_ulong = max_msgs as c_ulong;
 
-            read_fn(
-                self.channel_id,
-                msg_buffer.as_mut_ptr(),
-                &mut num_msgs,
-                timeout_ms,
-            )
-        };
+            let result = unsafe {
+                let read_fn: Symbol<PassThruReadMsgsV0500Fn> = self
+                    .library
+                    .get(b"PassThruReadMsgs\0")
+                    .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruReadMsgs - {}", e))?;
 
-        Ok(RawIoResult {
-            result,
-            num_msgs: num_msgs as u32,
-        })
+                read_fn(
+                    self.channel_id,
+                    msg_buffer.as_mut_ptr(),
+                    &mut num_msgs,
+                    timeout_ms,
+                )
+            };
+
+            // Keep backing_bufs alive until after the FFI call
+            drop(msg_buffer);
+            drop(backing_bufs);
+
+            Ok(RawIoResult {
+                result,
+                num_msgs: num_msgs as u32,
+            })
+        } else {
+            let mut msg_buffer: Vec<PassThruMsg> =
+                (0..max_msgs).map(|_| PassThruMsg::default()).collect();
+            let mut num_msgs: c_ulong = max_msgs as c_ulong;
+
+            let result = unsafe {
+                let read_fn: Symbol<PassThruReadMsgsFn> = self
+                    .library
+                    .get(b"PassThruReadMsgs\0")
+                    .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruReadMsgs - {}", e))?;
+
+                read_fn(
+                    self.channel_id,
+                    msg_buffer.as_mut_ptr(),
+                    &mut num_msgs,
+                    timeout_ms,
+                )
+            };
+
+            Ok(RawIoResult {
+                result,
+                num_msgs: num_msgs as u32,
+            })
+        }
     }
 
     #[allow(dead_code)]
@@ -1380,114 +1755,201 @@ impl J2534Connection {
         timeout_ms: u32,
         include_loopback: bool,
     ) -> Result<Vec<CANMessage>, String> {
+        let is_can = self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765;
         let mut messages = Vec::new();
 
-        // Create message buffer - use Vec since PassThruMsg is large and doesn't implement Copy
-        let mut msg_buffer: Vec<PassThruMsg> = (0..16).map(|_| PassThruMsg::default()).collect();
-        let mut num_msgs: c_ulong = 16;
+        if self.is_v0500 {
+            // v05.00: pointer-based DataBuffer
+            let mut backing_bufs: Vec<Vec<u8>> = (0..16).map(|_| vec![0u8; 4128]).collect();
+            let mut msg_buffer: Vec<PassThruMsgV0500> = backing_bufs
+                .iter_mut()
+                .map(|buf| {
+                    let mut msg = PassThruMsgV0500::new(buf);
+                    msg.protocol_id = self.protocol_id;
+                    msg
+                })
+                .collect();
+            let mut num_msgs: c_ulong = 16;
 
-        unsafe {
-            let read_fn: Symbol<PassThruReadMsgsFn> = self
-                .library
-                .get(b"PassThruReadMsgs\0")
-                .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruReadMsgs - {}", e))?;
+            unsafe {
+                let read_fn: Symbol<PassThruReadMsgsV0500Fn> = self
+                    .library
+                    .get(b"PassThruReadMsgs\0")
+                    .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruReadMsgs - {}", e))?;
 
-            let result = read_fn(
-                self.channel_id,
-                msg_buffer.as_mut_ptr(),
-                &mut num_msgs,
-                timeout_ms,
-            );
+                let result = read_fn(
+                    self.channel_id,
+                    msg_buffer.as_mut_ptr(),
+                    &mut num_msgs,
+                    timeout_ms,
+                );
 
-            // Allow STATUS_NOERROR, ERR_BUFFER_EMPTY, and ERR_TIMEOUT
-            // ERR_TIMEOUT can still return messages (e.g., ScanDoc WiFi adapter)
-            if result != STATUS_NOERROR && result != ERR_BUFFER_EMPTY && result != ERR_TIMEOUT {
-                return Err(format!(
-                    "ERR_J2534_READ_FAILED: error code {} ({})",
-                    result,
-                    error_code_to_string(result)
-                ));
-            }
-        }
-
-        let is_can = self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765;
-
-        for i in 0..num_msgs as usize {
-            let msg = &msg_buffer[i];
-
-            // Skip TX echo messages (loopback) - these have TX_MSG_TYPE flag set
-            // Unless include_loopback is true (for sanity testing)
-            if !include_loopback && (msg.rx_status & TX_MSG_TYPE) != 0 {
-                continue;
+                // Allow STATUS_NOERROR, ERR_BUFFER_EMPTY, and ERR_TIMEOUT
+                // ERR_TIMEOUT can still return messages (e.g., ScanDoc WiFi adapter)
+                if result != STATUS_NOERROR && result != ERR_BUFFER_EMPTY && result != ERR_TIMEOUT {
+                    return Err(format!(
+                        "ERR_J2534_READ_FAILED: error code {} ({})",
+                        result,
+                        error_code_to_string(result)
+                    ));
+                }
             }
 
-            if is_can {
-                // CAN/ISO15765: first 4 bytes are arb_id, rest is payload
-                if msg.data_size < 4 {
+            for i in 0..num_msgs as usize {
+                let msg = &msg_buffer[i];
+
+                // Skip TX echo messages (loopback) - these have TX_MSG_TYPE flag set
+                // Unless include_loopback is true (for sanity testing)
+                if !include_loopback && (msg.rx_status & TX_MSG_TYPE) != 0 {
                     continue;
                 }
 
-                let arb_id = ((msg.data[0] as u32) << 24)
-                    | ((msg.data[1] as u32) << 16)
-                    | ((msg.data[2] as u32) << 8)
-                    | (msg.data[3] as u32);
+                if let Some(can_msg) = msg.to_can_message(is_can) {
+                    if is_can {
+                        // Driver workaround: filter out TX echoes by matching against recently sent messages
+                        let is_tx_echo = if include_loopback {
+                            false
+                        } else if let Ok(mut sent) = self.sent_messages.lock() {
+                            let cutoff =
+                                std::time::Instant::now() - std::time::Duration::from_millis(500);
+                            sent.retain(|m| m.timestamp > cutoff);
 
-                let data_len = (msg.data_size - 4) as usize;
-                let data = msg.data[4..4 + data_len].to_vec();
-                let extended = (msg.rx_status & RX_CAN_29BIT_ID) != 0 || arb_id > 0x7FF;
+                            if let Some(pos) = sent
+                                .iter()
+                                .position(|m| m.arb_id == can_msg.arb_id && m.data == can_msg.data)
+                            {
+                                sent.remove(pos);
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
 
-                // Driver workaround: filter out TX echoes by matching against recently sent messages
-                let is_tx_echo = if include_loopback {
-                    false
-                } else if let Ok(mut sent) = self.sent_messages.lock() {
-                    let cutoff = std::time::Instant::now() - std::time::Duration::from_millis(500);
-                    sent.retain(|m| m.timestamp > cutoff);
+                        if is_tx_echo {
+                            continue;
+                        }
+                    }
 
-                    if let Some(pos) = sent
-                        .iter()
-                        .position(|m| m.arb_id == arb_id && m.data == data)
-                    {
-                        sent.remove(pos);
-                        true
+                    messages.push(can_msg);
+                }
+            }
+
+            // Keep backing_bufs alive until after we have parsed all messages
+            drop(msg_buffer);
+            drop(backing_bufs);
+        } else {
+            // v04.04: inline data[4128]
+            let mut msg_buffer: Vec<PassThruMsg> =
+                (0..16).map(|_| PassThruMsg::default()).collect();
+            let mut num_msgs: c_ulong = 16;
+
+            unsafe {
+                let read_fn: Symbol<PassThruReadMsgsFn> = self
+                    .library
+                    .get(b"PassThruReadMsgs\0")
+                    .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruReadMsgs - {}", e))?;
+
+                let result = read_fn(
+                    self.channel_id,
+                    msg_buffer.as_mut_ptr(),
+                    &mut num_msgs,
+                    timeout_ms,
+                );
+
+                // Allow STATUS_NOERROR, ERR_BUFFER_EMPTY, and ERR_TIMEOUT
+                // ERR_TIMEOUT can still return messages (e.g., ScanDoc WiFi adapter)
+                if result != STATUS_NOERROR
+                    && result != ERR_BUFFER_EMPTY
+                    && result != ERR_TIMEOUT
+                {
+                    return Err(format!(
+                        "ERR_J2534_READ_FAILED: error code {} ({})",
+                        result,
+                        error_code_to_string(result)
+                    ));
+                }
+            }
+
+            for i in 0..num_msgs as usize {
+                let msg = &msg_buffer[i];
+
+                // Skip TX echo messages (loopback) - these have TX_MSG_TYPE flag set
+                // Unless include_loopback is true (for sanity testing)
+                if !include_loopback && (msg.rx_status & TX_MSG_TYPE) != 0 {
+                    continue;
+                }
+
+                if is_can {
+                    // CAN/ISO15765: first 4 bytes are arb_id, rest is payload
+                    if msg.data_size < 4 {
+                        continue;
+                    }
+
+                    let arb_id = ((msg.data[0] as u32) << 24)
+                        | ((msg.data[1] as u32) << 16)
+                        | ((msg.data[2] as u32) << 8)
+                        | (msg.data[3] as u32);
+
+                    let data_len = (msg.data_size - 4) as usize;
+                    let data = msg.data[4..4 + data_len].to_vec();
+                    let extended = (msg.rx_status & RX_CAN_29BIT_ID) != 0 || arb_id > 0x7FF;
+
+                    // Driver workaround: filter out TX echoes by matching against recently sent messages
+                    let is_tx_echo = if include_loopback {
+                        false
+                    } else if let Ok(mut sent) = self.sent_messages.lock() {
+                        let cutoff =
+                            std::time::Instant::now() - std::time::Duration::from_millis(500);
+                        sent.retain(|m| m.timestamp > cutoff);
+
+                        if let Some(pos) = sent
+                            .iter()
+                            .position(|m| m.arb_id == arb_id && m.data == data)
+                        {
+                            sent.remove(pos);
+                            true
+                        } else {
+                            false
+                        }
                     } else {
                         false
+                    };
+
+                    if is_tx_echo {
+                        continue;
                     }
+
+                    messages.push(CANMessage {
+                        timestamp_us: msg.timestamp as u64,
+                        arb_id,
+                        extended,
+                        data,
+                        raw_arb_id: arb_id,
+                        rx_status: msg.rx_status,
+                        data_size: msg.data_size,
+                        protocol_id: msg.protocol_id,
+                    });
                 } else {
-                    false
-                };
+                    // ISO 9141 / ISO 14230 (K-Line): all bytes are raw serial data, no arb_id
+                    if msg.data_size == 0 {
+                        continue;
+                    }
 
-                if is_tx_echo {
-                    continue;
+                    let data = msg.data[..msg.data_size as usize].to_vec();
+
+                    messages.push(CANMessage {
+                        timestamp_us: msg.timestamp as u64,
+                        arb_id: 0,
+                        extended: false,
+                        data,
+                        raw_arb_id: 0,
+                        rx_status: msg.rx_status,
+                        data_size: msg.data_size,
+                        protocol_id: msg.protocol_id,
+                    });
                 }
-
-                messages.push(CANMessage {
-                    timestamp_us: msg.timestamp as u64,
-                    arb_id,
-                    extended,
-                    data,
-                    raw_arb_id: arb_id,
-                    rx_status: msg.rx_status,
-                    data_size: msg.data_size,
-                    protocol_id: msg.protocol_id,
-                });
-            } else {
-                // ISO 9141 / ISO 14230 (K-Line): all bytes are raw serial data, no arb_id
-                if msg.data_size == 0 {
-                    continue;
-                }
-
-                let data = msg.data[..msg.data_size as usize].to_vec();
-
-                messages.push(CANMessage {
-                    timestamp_us: msg.timestamp as u64,
-                    arb_id: 0,
-                    extended: false,
-                    data,
-                    raw_arb_id: 0,
-                    rx_status: msg.rx_status,
-                    data_size: msg.data_size,
-                    protocol_id: msg.protocol_id,
-                });
             }
         }
 
@@ -1515,185 +1977,382 @@ impl J2534Connection {
         let max_drain_reads = max_drain_reads.clamp(1, 256) as usize;
         let is_can = self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765;
         let mut all_messages = Vec::new();
-        let mut msg_buffer: Vec<PassThruMsg> =
-            (0..batch_size).map(|_| PassThruMsg::default()).collect();
 
-        let read_fn = unsafe {
-            self.library
-                .get::<PassThruReadMsgsFn>(b"PassThruReadMsgs\0")
-                .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruReadMsgs - {}", e))?
-        };
+        if self.is_v0500 {
+            // v05.00: pointer-based DataBuffer — resolve read fn once for the hot loop
+            let read_fn = unsafe {
+                self.library
+                    .get::<PassThruReadMsgsV0500Fn>(b"PassThruReadMsgs\0")
+                    .map_err(|e| {
+                        format!("ERR_J2534_FUNC_NOT_FOUND: PassThruReadMsgs - {}", e)
+                    })?
+            };
 
-        for iteration in 0..max_drain_reads {
-            let t = if iteration == 0 { timeout_ms } else { 0 };
-            let mut num_msgs = batch_size as c_ulong;
+            // Allocate backing buffers once, reused across iterations
+            let mut backing_bufs: Vec<Vec<u8>> =
+                (0..batch_size).map(|_| vec![0u8; 4128]).collect();
 
-            let result =
-                unsafe { read_fn(self.channel_id, msg_buffer.as_mut_ptr(), &mut num_msgs, t) };
+            for iteration in 0..max_drain_reads {
+                let t = if iteration == 0 { timeout_ms } else { 0 };
 
-            // Allow STATUS_NOERROR, ERR_BUFFER_EMPTY, and ERR_TIMEOUT
-            if result != STATUS_NOERROR && result != ERR_BUFFER_EMPTY && result != ERR_TIMEOUT {
-                if iteration == 0 {
-                    return Err(format!(
-                        "ERR_J2534_READ_FAILED: error code {} ({})",
-                        result,
-                        error_code_to_string(result)
-                    ));
-                }
-                break; // got some messages already, return what we have
-            }
-
-            if num_msgs == 0 {
-                break;
-            }
-
-            for i in 0..num_msgs as usize {
-                let msg = &msg_buffer[i];
-
-                // Skip TX echoes by flag
-                if (msg.rx_status & TX_MSG_TYPE) != 0 {
-                    continue;
-                }
-
-                if is_can {
-                    // CAN/ISO15765: first 4 bytes are arb_id, rest is payload
-                    if msg.data_size < 4 {
-                        continue;
-                    }
-
-                    let arb_id =
-                        u32::from_be_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
-                    let data_len = (msg.data_size - 4) as usize;
-                    let data = msg.data[4..4 + data_len].to_vec();
-                    let extended = (msg.rx_status & RX_CAN_29BIT_ID) != 0 || arb_id > 0x7FF;
-
-                    // Driver workaround: filter TX echoes by matching sent_messages
-                    let is_echo = if let Ok(mut sent) = self.sent_messages.lock() {
-                        let cutoff =
-                            std::time::Instant::now() - std::time::Duration::from_millis(500);
-                        sent.retain(|m| m.timestamp > cutoff);
-
-                        if let Some(pos) = sent
-                            .iter()
-                            .position(|m| m.arb_id == arb_id && m.data == data)
-                        {
-                            sent.remove(pos);
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
-
-                    if is_echo {
-                        continue;
-                    }
-
-                    all_messages.push(CANMessage {
-                        timestamp_us: msg.timestamp as u64,
-                        arb_id,
-                        extended,
-                        data,
-                        raw_arb_id: arb_id,
-                        rx_status: msg.rx_status,
-                        data_size: msg.data_size,
-                        protocol_id: msg.protocol_id,
-                    });
-                } else {
-                    // ISO 9141 / ISO 14230 (K-Line): all bytes are raw serial data
-                    if msg.data_size == 0 {
-                        continue;
-                    }
-
-                    let data = msg.data[..msg.data_size as usize].to_vec();
-
-                    all_messages.push(CANMessage {
-                        timestamp_us: msg.timestamp as u64,
-                        arb_id: 0,
-                        extended: false,
-                        data,
-                        raw_arb_id: 0,
-                        rx_status: msg.rx_status,
-                        data_size: msg.data_size,
-                        protocol_id: msg.protocol_id,
-                    });
-                }
-            }
-
-            // If we got fewer than batch_size, buffer is drained
-            if (num_msgs as usize) < batch_size {
-                break;
-            }
-        }
-
-        // Drain the dedicated 29-bit channel (if present)
-        if let Some(ch29) = self.channel_id_29bit {
-            let mut msg_buffer_29: Vec<PassThruMsg> =
-                (0..batch_size).map(|_| PassThruMsg::default()).collect();
-
-            for _ in 0..max_drain_reads {
+                // Reinitialize msg structs each iteration (pointers into backing_bufs)
+                let mut msg_buffer: Vec<PassThruMsgV0500> = backing_bufs
+                    .iter_mut()
+                    .map(|buf| {
+                        let mut msg = PassThruMsgV0500::new(buf);
+                        msg.protocol_id = self.protocol_id;
+                        msg
+                    })
+                    .collect();
                 let mut num_msgs = batch_size as c_ulong;
-                let result = unsafe { read_fn(ch29, msg_buffer_29.as_mut_ptr(), &mut num_msgs, 0) };
 
-                if result != STATUS_NOERROR && result != ERR_BUFFER_EMPTY && result != ERR_TIMEOUT {
+                let result = unsafe {
+                    read_fn(
+                        self.channel_id,
+                        msg_buffer.as_mut_ptr(),
+                        &mut num_msgs,
+                        t,
+                    )
+                };
+
+                // Allow STATUS_NOERROR, ERR_BUFFER_EMPTY, and ERR_TIMEOUT
+                if result != STATUS_NOERROR
+                    && result != ERR_BUFFER_EMPTY
+                    && result != ERR_TIMEOUT
+                {
+                    if iteration == 0 {
+                        return Err(format!(
+                            "ERR_J2534_READ_FAILED: error code {} ({})",
+                            result,
+                            error_code_to_string(result)
+                        ));
+                    }
                     break;
                 }
+
                 if num_msgs == 0 {
                     break;
                 }
 
                 for i in 0..num_msgs as usize {
-                    let msg = &msg_buffer_29[i];
+                    let msg = &msg_buffer[i];
+
+                    // Skip TX echoes by flag
                     if (msg.rx_status & TX_MSG_TYPE) != 0 {
                         continue;
                     }
-                    if msg.data_size < 4 {
-                        continue;
-                    }
 
-                    let arb_id =
-                        u32::from_be_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
-                    let data_len = (msg.data_size - 4) as usize;
-                    let data = msg.data[4..4 + data_len].to_vec();
-                    // Always extended on this channel
-                    let extended = true;
+                    if let Some(can_msg) = msg.to_can_message(is_can) {
+                        if is_can {
+                            // Driver workaround: filter TX echoes by matching sent_messages
+                            let is_echo = if let Ok(mut sent) = self.sent_messages.lock() {
+                                let cutoff = std::time::Instant::now()
+                                    - std::time::Duration::from_millis(500);
+                                sent.retain(|m| m.timestamp > cutoff);
 
-                    let is_echo = if let Ok(mut sent) = self.sent_messages.lock() {
-                        let cutoff =
-                            std::time::Instant::now() - std::time::Duration::from_millis(500);
-                        sent.retain(|m| m.timestamp > cutoff);
-                        if let Some(pos) = sent
-                            .iter()
-                            .position(|m| m.arb_id == arb_id && m.data == data)
-                        {
-                            sent.remove(pos);
-                            true
-                        } else {
-                            false
+                                if let Some(pos) = sent.iter().position(|m| {
+                                    m.arb_id == can_msg.arb_id && m.data == can_msg.data
+                                }) {
+                                    sent.remove(pos);
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+
+                            if is_echo {
+                                continue;
+                            }
                         }
-                    } else {
-                        false
-                    };
 
-                    if is_echo {
-                        continue;
+                        all_messages.push(can_msg);
                     }
-
-                    all_messages.push(CANMessage {
-                        timestamp_us: msg.timestamp as u64,
-                        arb_id,
-                        extended,
-                        data,
-                        raw_arb_id: arb_id,
-                        rx_status: msg.rx_status,
-                        data_size: msg.data_size,
-                        protocol_id: msg.protocol_id,
-                    });
                 }
 
+                // If we got fewer than batch_size, buffer is drained
                 if (num_msgs as usize) < batch_size {
                     break;
+                }
+            }
+
+            // Drain the dedicated 29-bit channel (if present)
+            if let Some(ch29) = self.channel_id_29bit {
+                let mut backing_bufs_29: Vec<Vec<u8>> =
+                    (0..batch_size).map(|_| vec![0u8; 4128]).collect();
+
+                for _ in 0..max_drain_reads {
+                    let mut msg_buffer_29: Vec<PassThruMsgV0500> = backing_bufs_29
+                        .iter_mut()
+                        .map(|buf| {
+                            let mut msg = PassThruMsgV0500::new(buf);
+                            msg.protocol_id = self.protocol_id;
+                            msg
+                        })
+                        .collect();
+                    let mut num_msgs = batch_size as c_ulong;
+
+                    let result = unsafe {
+                        read_fn(ch29, msg_buffer_29.as_mut_ptr(), &mut num_msgs, 0)
+                    };
+
+                    if result != STATUS_NOERROR
+                        && result != ERR_BUFFER_EMPTY
+                        && result != ERR_TIMEOUT
+                    {
+                        break;
+                    }
+                    if num_msgs == 0 {
+                        break;
+                    }
+
+                    for i in 0..num_msgs as usize {
+                        let msg = &msg_buffer_29[i];
+                        if (msg.rx_status & TX_MSG_TYPE) != 0 {
+                            continue;
+                        }
+
+                        // 29-bit channel is always CAN with extended IDs
+                        if let Some(mut can_msg) = msg.to_can_message(true) {
+                            can_msg.extended = true;
+
+                            let is_echo = if let Ok(mut sent) = self.sent_messages.lock() {
+                                let cutoff = std::time::Instant::now()
+                                    - std::time::Duration::from_millis(500);
+                                sent.retain(|m| m.timestamp > cutoff);
+                                if let Some(pos) = sent.iter().position(|m| {
+                                    m.arb_id == can_msg.arb_id && m.data == can_msg.data
+                                }) {
+                                    sent.remove(pos);
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+
+                            if is_echo {
+                                continue;
+                            }
+
+                            all_messages.push(can_msg);
+                        }
+                    }
+
+                    if (num_msgs as usize) < batch_size {
+                        break;
+                    }
+                }
+            }
+        } else {
+            // v04.04: inline data[4128]
+            let mut msg_buffer: Vec<PassThruMsg> =
+                (0..batch_size).map(|_| PassThruMsg::default()).collect();
+
+            let read_fn = unsafe {
+                self.library
+                    .get::<PassThruReadMsgsFn>(b"PassThruReadMsgs\0")
+                    .map_err(|e| {
+                        format!("ERR_J2534_FUNC_NOT_FOUND: PassThruReadMsgs - {}", e)
+                    })?
+            };
+
+            for iteration in 0..max_drain_reads {
+                let t = if iteration == 0 { timeout_ms } else { 0 };
+                let mut num_msgs = batch_size as c_ulong;
+
+                let result = unsafe {
+                    read_fn(
+                        self.channel_id,
+                        msg_buffer.as_mut_ptr(),
+                        &mut num_msgs,
+                        t,
+                    )
+                };
+
+                // Allow STATUS_NOERROR, ERR_BUFFER_EMPTY, and ERR_TIMEOUT
+                if result != STATUS_NOERROR
+                    && result != ERR_BUFFER_EMPTY
+                    && result != ERR_TIMEOUT
+                {
+                    if iteration == 0 {
+                        return Err(format!(
+                            "ERR_J2534_READ_FAILED: error code {} ({})",
+                            result,
+                            error_code_to_string(result)
+                        ));
+                    }
+                    break; // got some messages already, return what we have
+                }
+
+                if num_msgs == 0 {
+                    break;
+                }
+
+                for i in 0..num_msgs as usize {
+                    let msg = &msg_buffer[i];
+
+                    // Skip TX echoes by flag
+                    if (msg.rx_status & TX_MSG_TYPE) != 0 {
+                        continue;
+                    }
+
+                    if is_can {
+                        // CAN/ISO15765: first 4 bytes are arb_id, rest is payload
+                        if msg.data_size < 4 {
+                            continue;
+                        }
+
+                        let arb_id = u32::from_be_bytes([
+                            msg.data[0],
+                            msg.data[1],
+                            msg.data[2],
+                            msg.data[3],
+                        ]);
+                        let data_len = (msg.data_size - 4) as usize;
+                        let data = msg.data[4..4 + data_len].to_vec();
+                        let extended =
+                            (msg.rx_status & RX_CAN_29BIT_ID) != 0 || arb_id > 0x7FF;
+
+                        // Driver workaround: filter TX echoes by matching sent_messages
+                        let is_echo = if let Ok(mut sent) = self.sent_messages.lock() {
+                            let cutoff = std::time::Instant::now()
+                                - std::time::Duration::from_millis(500);
+                            sent.retain(|m| m.timestamp > cutoff);
+
+                            if let Some(pos) = sent
+                                .iter()
+                                .position(|m| m.arb_id == arb_id && m.data == data)
+                            {
+                                sent.remove(pos);
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+
+                        if is_echo {
+                            continue;
+                        }
+
+                        all_messages.push(CANMessage {
+                            timestamp_us: msg.timestamp as u64,
+                            arb_id,
+                            extended,
+                            data,
+                            raw_arb_id: arb_id,
+                            rx_status: msg.rx_status,
+                            data_size: msg.data_size,
+                            protocol_id: msg.protocol_id,
+                        });
+                    } else {
+                        // ISO 9141 / ISO 14230 (K-Line): all bytes are raw serial data
+                        if msg.data_size == 0 {
+                            continue;
+                        }
+
+                        let data = msg.data[..msg.data_size as usize].to_vec();
+
+                        all_messages.push(CANMessage {
+                            timestamp_us: msg.timestamp as u64,
+                            arb_id: 0,
+                            extended: false,
+                            data,
+                            raw_arb_id: 0,
+                            rx_status: msg.rx_status,
+                            data_size: msg.data_size,
+                            protocol_id: msg.protocol_id,
+                        });
+                    }
+                }
+
+                // If we got fewer than batch_size, buffer is drained
+                if (num_msgs as usize) < batch_size {
+                    break;
+                }
+            }
+
+            // Drain the dedicated 29-bit channel (if present)
+            if let Some(ch29) = self.channel_id_29bit {
+                let mut msg_buffer_29: Vec<PassThruMsg> =
+                    (0..batch_size).map(|_| PassThruMsg::default()).collect();
+
+                for _ in 0..max_drain_reads {
+                    let mut num_msgs = batch_size as c_ulong;
+                    let result = unsafe {
+                        read_fn(ch29, msg_buffer_29.as_mut_ptr(), &mut num_msgs, 0)
+                    };
+
+                    if result != STATUS_NOERROR
+                        && result != ERR_BUFFER_EMPTY
+                        && result != ERR_TIMEOUT
+                    {
+                        break;
+                    }
+                    if num_msgs == 0 {
+                        break;
+                    }
+
+                    for i in 0..num_msgs as usize {
+                        let msg = &msg_buffer_29[i];
+                        if (msg.rx_status & TX_MSG_TYPE) != 0 {
+                            continue;
+                        }
+                        if msg.data_size < 4 {
+                            continue;
+                        }
+
+                        let arb_id = u32::from_be_bytes([
+                            msg.data[0],
+                            msg.data[1],
+                            msg.data[2],
+                            msg.data[3],
+                        ]);
+                        let data_len = (msg.data_size - 4) as usize;
+                        let data = msg.data[4..4 + data_len].to_vec();
+                        // Always extended on this channel
+                        let extended = true;
+
+                        let is_echo = if let Ok(mut sent) = self.sent_messages.lock() {
+                            let cutoff = std::time::Instant::now()
+                                - std::time::Duration::from_millis(500);
+                            sent.retain(|m| m.timestamp > cutoff);
+                            if let Some(pos) = sent
+                                .iter()
+                                .position(|m| m.arb_id == arb_id && m.data == data)
+                            {
+                                sent.remove(pos);
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+
+                        if is_echo {
+                            continue;
+                        }
+
+                        all_messages.push(CANMessage {
+                            timestamp_us: msg.timestamp as u64,
+                            arb_id,
+                            extended,
+                            data,
+                            raw_arb_id: arb_id,
+                            rx_status: msg.rx_status,
+                            data_size: msg.data_size,
+                            protocol_id: msg.protocol_id,
+                        });
+                    }
+
+                    if (num_msgs as usize) < batch_size {
+                        break;
+                    }
                 }
             }
         }
@@ -1871,38 +2530,62 @@ impl J2534Connection {
         interval_ms: u32,
         extended: bool,
     ) -> Result<u32, String> {
-        let mut msg = PassThruMsg::default();
-        msg.protocol_id = self.protocol_id;
-        msg.tx_flags = if extended { CAN_29BIT_ID } else { 0 };
-
-        // First 4 bytes are the CAN ID
-        msg.data[0] = ((arb_id >> 24) & 0xFF) as u8;
-        msg.data[1] = ((arb_id >> 16) & 0xFF) as u8;
-        msg.data[2] = ((arb_id >> 8) & 0xFF) as u8;
-        msg.data[3] = (arb_id & 0xFF) as u8;
-
-        // Copy data bytes (CAN limited to 8 bytes)
-        let data_len = data.len().min(8);
-        msg.data[4..4 + data_len].copy_from_slice(&data[..data_len]);
-        msg.data_size = (4 + data_len) as u32;
-
         let mut msg_id: c_ulong = 0;
 
-        unsafe {
-            let start_periodic_fn: Symbol<PassThruStartPeriodicMsgFn> = self
-                .library
-                .get(b"PassThruStartPeriodicMsg\0")
-                .map_err(|e| {
-                    format!("ERR_J2534_FUNC_NOT_FOUND: PassThruStartPeriodicMsg - {}", e)
-                })?;
+        if self.is_v0500 {
+            let mut buf = Vec::with_capacity(12);
+            Self::build_v0500_can_msg(&mut buf, self.protocol_id, arb_id, data, extended);
+            let mut msg = PassThruMsgV0500::new(&mut buf);
+            msg.protocol_id = self.protocol_id;
+            msg.tx_flags = if extended { CAN_29BIT_ID } else { 0 };
+            msg.data_length = buf.len() as u32;
+            msg.extra_data_index = buf.len() as u32;
 
-            let result = start_periodic_fn(self.channel_id, &msg, &mut msg_id, interval_ms);
-            if result != STATUS_NOERROR {
-                return Err(format!(
-                    "ERR_J2534_START_PERIODIC_FAILED: error code {} ({})",
-                    result,
-                    error_code_to_string(result)
-                ));
+            unsafe {
+                let start_periodic_fn: Symbol<PassThruStartPeriodicMsgV0500Fn> = self
+                    .library
+                    .get(b"PassThruStartPeriodicMsg\0")
+                    .map_err(|e| {
+                        format!("ERR_J2534_FUNC_NOT_FOUND: PassThruStartPeriodicMsg - {}", e)
+                    })?;
+                let result =
+                    start_periodic_fn(self.channel_id, &msg, &mut msg_id, interval_ms);
+                if result != STATUS_NOERROR {
+                    return Err(format!(
+                        "ERR_J2534_START_PERIODIC_FAILED: error code {} ({})",
+                        result,
+                        error_code_to_string(result)
+                    ));
+                }
+            }
+        } else {
+            let mut msg = PassThruMsg::default();
+            msg.protocol_id = self.protocol_id;
+            msg.tx_flags = if extended { CAN_29BIT_ID } else { 0 };
+            msg.data[0] = ((arb_id >> 24) & 0xFF) as u8;
+            msg.data[1] = ((arb_id >> 16) & 0xFF) as u8;
+            msg.data[2] = ((arb_id >> 8) & 0xFF) as u8;
+            msg.data[3] = (arb_id & 0xFF) as u8;
+            let data_len = data.len().min(8);
+            msg.data[4..4 + data_len].copy_from_slice(&data[..data_len]);
+            msg.data_size = (4 + data_len) as u32;
+
+            unsafe {
+                let start_periodic_fn: Symbol<PassThruStartPeriodicMsgFn> = self
+                    .library
+                    .get(b"PassThruStartPeriodicMsg\0")
+                    .map_err(|e| {
+                        format!("ERR_J2534_FUNC_NOT_FOUND: PassThruStartPeriodicMsg - {}", e)
+                    })?;
+                let result =
+                    start_periodic_fn(self.channel_id, &msg, &mut msg_id, interval_ms);
+                if result != STATUS_NOERROR {
+                    return Err(format!(
+                        "ERR_J2534_START_PERIODIC_FAILED: error code {} ({})",
+                        result,
+                        error_code_to_string(result)
+                    ));
+                }
             }
         }
 
@@ -1967,46 +2650,26 @@ impl J2534Connection {
         pattern: &[u8],
         extended: bool,
     ) -> Result<u32, String> {
-        let mut mask_msg = PassThruMsg::default();
-        mask_msg.protocol_id = self.protocol_id;
-        mask_msg.tx_flags = if extended { CAN_29BIT_ID } else { 0 };
-        let mask_len = mask.len().min(4);
-        mask_msg.data[..mask_len].copy_from_slice(&mask[..mask_len]);
-        mask_msg.data_size = 4;
+        // Pad to 4 bytes
+        let mut mask4 = [0u8; 4];
+        let ml = mask.len().min(4);
+        mask4[..ml].copy_from_slice(&mask[..ml]);
+        let mut pat4 = [0u8; 4];
+        let pl = pattern.len().min(4);
+        pat4[..pl].copy_from_slice(&pattern[..pl]);
 
-        let mut pattern_msg = PassThruMsg::default();
-        pattern_msg.protocol_id = self.protocol_id;
-        pattern_msg.tx_flags = if extended { CAN_29BIT_ID } else { 0 };
-        let pattern_len = pattern.len().min(4);
-        pattern_msg.data[..pattern_len].copy_from_slice(&pattern[..pattern_len]);
-        pattern_msg.data_size = 4;
-
-        let mut filter_id: c_ulong = 0;
-
-        unsafe {
-            let filter_fn: Symbol<PassThruStartMsgFilterFn> = self
-                .library
-                .get(b"PassThruStartMsgFilter\0")
-                .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruStartMsgFilter - {}", e))?;
-
-            let result = filter_fn(
-                self.channel_id,
-                filter_type,
-                &mask_msg,
-                &pattern_msg,
-                std::ptr::null(),
-                &mut filter_id,
-            );
-            if result != STATUS_NOERROR {
-                return Err(format!(
-                    "ERR_J2534_ADD_FILTER_FAILED: error code {} ({})",
-                    result,
-                    error_code_to_string(result)
-                ));
-            }
+        let tx_flags = if extended { CAN_29BIT_ID } else { 0 };
+        if self.is_v0500 {
+            Self::install_filter_v0500(
+                &self.library, self.channel_id, filter_type,
+                self.protocol_id, &mask4, &pat4, tx_flags,
+            )
+        } else {
+            Self::install_filter_v0404(
+                &self.library, self.channel_id, filter_type,
+                self.protocol_id, &mask4, &pat4, tx_flags,
+            )
         }
-
-        Ok(filter_id)
     }
 
     /// Add a message filter with raw mask/pattern sizes (1-12 bytes)
@@ -2024,44 +2687,18 @@ impl J2534Connection {
             return Err("ERR_J2534_ADD_FILTER_FAILED: mask/pattern must be 1-12 bytes".to_string());
         }
 
-        let mut mask_msg = PassThruMsg::default();
-        mask_msg.protocol_id = self.protocol_id;
-        mask_msg.tx_flags = if extended { CAN_29BIT_ID } else { 0 };
-        mask_msg.data[..mask_len].copy_from_slice(&mask[..mask_len]);
-        mask_msg.data_size = mask_len as u32;
-
-        let mut pattern_msg = PassThruMsg::default();
-        pattern_msg.protocol_id = self.protocol_id;
-        pattern_msg.tx_flags = if extended { CAN_29BIT_ID } else { 0 };
-        pattern_msg.data[..pattern_len].copy_from_slice(&pattern[..pattern_len]);
-        pattern_msg.data_size = pattern_len as u32;
-
-        let mut filter_id: c_ulong = 0;
-
-        unsafe {
-            let filter_fn: Symbol<PassThruStartMsgFilterFn> = self
-                .library
-                .get(b"PassThruStartMsgFilter\0")
-                .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruStartMsgFilter - {}", e))?;
-
-            let result = filter_fn(
-                self.channel_id,
-                filter_type,
-                &mask_msg,
-                &pattern_msg,
-                std::ptr::null(),
-                &mut filter_id,
-            );
-            if result != STATUS_NOERROR {
-                return Err(format!(
-                    "ERR_J2534_ADD_FILTER_FAILED: error code {} ({})",
-                    result,
-                    error_code_to_string(result)
-                ));
-            }
+        let tx_flags = if extended { CAN_29BIT_ID } else { 0 };
+        if self.is_v0500 {
+            Self::install_filter_v0500(
+                &self.library, self.channel_id, filter_type,
+                self.protocol_id, &mask[..mask_len], &pattern[..pattern_len], tx_flags,
+            )
+        } else {
+            Self::install_filter_v0404(
+                &self.library, self.channel_id, filter_type,
+                self.protocol_id, &mask[..mask_len], &pattern[..pattern_len], tx_flags,
+            )
         }
-
-        Ok(filter_id)
     }
 
     /// Remove a message filter
@@ -2196,37 +2833,70 @@ impl J2534Connection {
     }
 
     pub fn fast_init(&self, data: &[u8]) -> Result<CANMessage, String> {
-        let mut input = PassThruMsg::default();
-        input.protocol_id = self.protocol_id;
-        input.data_size = data.len() as u32;
-        input.data[..data.len()].copy_from_slice(data);
-        let mut output = PassThruMsg::default();
+        if self.is_v0500 {
+            let mut in_buf = data.to_vec();
+            let mut input = PassThruMsgV0500::new(&mut in_buf);
+            input.protocol_id = self.protocol_id;
+            input.data_length = data.len() as u32;
+            let mut out_buf = vec![0u8; 4128];
+            let mut output = PassThruMsgV0500::new(&mut out_buf);
+            output.protocol_id = self.protocol_id;
 
-        unsafe {
-            let ioctl_fn: Symbol<PassThruIoctlFn> = self
-                .library
-                .get(b"PassThruIoctl\0")
-                .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruIoctl - {}", e))?;
-
-            let result = ioctl_fn(
-                self.channel_id,
-                FAST_INIT,
-                &mut input as *mut PassThruMsg as *mut c_void,
-                &mut output as *mut PassThruMsg as *mut c_void,
-            );
-
-            if result != STATUS_NOERROR {
-                let last_error = get_last_error_message(&self.library);
-                return Err(format!(
-                    "ERR_J2534_FAST_INIT_FAILED: error code {} ({}){}",
-                    result,
-                    error_code_to_string(result),
-                    last_error.map(|s| format!(" - {}", s)).unwrap_or_default()
-                ));
+            unsafe {
+                let ioctl_fn: Symbol<PassThruIoctlFn> = self
+                    .library
+                    .get(b"PassThruIoctl\0")
+                    .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruIoctl - {}", e))?;
+                let result = ioctl_fn(
+                    self.channel_id,
+                    FAST_INIT,
+                    &mut input as *mut PassThruMsgV0500 as *mut c_void,
+                    &mut output as *mut PassThruMsgV0500 as *mut c_void,
+                );
+                if result != STATUS_NOERROR {
+                    let last_error = get_last_error_message(&self.library);
+                    return Err(format!(
+                        "ERR_J2534_FAST_INIT_FAILED: error code {} ({}){}",
+                        result,
+                        error_code_to_string(result),
+                        last_error.map(|s| format!(" - {}", s)).unwrap_or_default()
+                    ));
+                }
             }
-        }
+            let is_can = self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765;
+            output
+                .to_can_message(is_can)
+                .ok_or_else(|| "ERR_J2534_FAST_INIT_FAILED: empty response".to_string())
+        } else {
+            let mut input = PassThruMsg::default();
+            input.protocol_id = self.protocol_id;
+            input.data_size = data.len() as u32;
+            input.data[..data.len()].copy_from_slice(data);
+            let mut output = PassThruMsg::default();
 
-        Ok(passthru_msg_to_can_message(&output))
+            unsafe {
+                let ioctl_fn: Symbol<PassThruIoctlFn> = self
+                    .library
+                    .get(b"PassThruIoctl\0")
+                    .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruIoctl - {}", e))?;
+                let result = ioctl_fn(
+                    self.channel_id,
+                    FAST_INIT,
+                    &mut input as *mut PassThruMsg as *mut c_void,
+                    &mut output as *mut PassThruMsg as *mut c_void,
+                );
+                if result != STATUS_NOERROR {
+                    let last_error = get_last_error_message(&self.library);
+                    return Err(format!(
+                        "ERR_J2534_FAST_INIT_FAILED: error code {} ({}){}",
+                        result,
+                        error_code_to_string(result),
+                        last_error.map(|s| format!(" - {}", s)).unwrap_or_default()
+                    ));
+                }
+            }
+            Ok(passthru_msg_to_can_message(&output))
+        }
     }
 
     /// Full K-Line init with CC polling — runs entirely in-process.
@@ -2414,5 +3084,22 @@ impl Drop for J2534Connection {
                 close_fn(self.device_id);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod v0500_layout_tests {
+    use super::*;
+    
+    #[test]
+    fn v0500_msg_layout() {
+        assert_eq!(std::mem::size_of::<PassThruMsgV0500>(), 40, "v0500 msg must be 40 bytes (packed)");
+        
+        let mut buf = vec![0u8; 80];
+        let msg = PassThruMsgV0500::new(&mut buf);
+        let base = &msg as *const _ as usize;
+        assert_eq!(std::ptr::addr_of!(msg.protocol_id) as usize - base, 0);
+        assert_eq!(std::ptr::addr_of!(msg.data_buffer) as usize - base, 28, "data_buffer must be at offset 28 (packed)");
+        assert_eq!(std::ptr::addr_of!(msg.data_buffer_size) as usize - base, 36);
     }
 }
