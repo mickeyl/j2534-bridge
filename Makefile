@@ -52,7 +52,7 @@ help:
 	@echo "  EXTRA='...'              Extra args passed to j2534-dump"
 	@echo ""
 	@echo "Targets:"
-	@echo "  make test                  Run unit tests (protocol + worker)"
+	@echo "  make test                  Run fmt, clippy, and library unit tests (refuses on macOS)"
 	@echo "  make list"
 	@echo "  make ensure-bridge-dev     Build and publish fresh dev bridge binaries for CANcorder"
 	@echo "  make native-build          Build standalone C J2534 v5.0 test harness"
@@ -70,7 +70,13 @@ help:
 	@echo "  make dump-isotp DEVICE='My Adapter'"
 
 test:
-	$(CARGO) test
+	@if [ "$$(uname -s)" = "Darwin" ]; then \
+		echo "make test is not intended to run on macOS; use Windows or CI instead."; \
+		exit 1; \
+	fi
+	$(CARGO) fmt --all
+	$(CARGO) clippy --lib -- -D warnings
+	$(CARGO) test --lib --verbose
 
 ensure-bridge:
 	$(CARGO) build $(BUILD_TARGET) --bin j2534-bridge
