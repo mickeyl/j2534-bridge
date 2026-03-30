@@ -2,8 +2,13 @@
 name = "j2534-bridge"
 version = "0.1.0"
 edition = "2021"
-description = "Out-of-process J2534 bridge with named-pipe IPC"
+description = "Out-of-process J2534 PassThru bridge for cross-bitness DLL loading and fault isolation."
 license = "MIT"
+repository = "https://github.com/mickeyl/j2534-bridge"
+readme = "README.md"
+rust-version = "1.70"
+keywords = ["j2534", "can", "automotive", "windows", "passthru"]
+categories = ["api-bindings", "hardware-support", "os::windows-apis"]
 
 [lib]
 name = "j2534_bridge"

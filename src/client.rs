@@ -813,6 +813,40 @@ impl BridgeClient {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_clients_use_unique_pipe_names() {
+        let first = BridgeClient::new();
+        let second = BridgeClient::new();
+
+        assert_ne!(first.pipe_name, second.pipe_name);
+        assert!(first.pipe_name.starts_with("\\\\.\\pipe\\j2534-bridge-"));
+        assert!(second.pipe_name.starts_with("\\\\.\\pipe\\j2534-bridge-"));
+    }
+
+    #[test]
+    fn stop_without_start_is_a_noop() {
+        let mut client = BridgeClient::new();
+
+        assert!(client.stop().is_ok());
+        assert!(!client.is_running());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn start_returns_clear_error_on_non_windows() {
+        let mut client = BridgeClient::new();
+
+        assert_eq!(
+            client.start(64).unwrap_err(),
+            "Bridge client is only supported on Windows"
+        );
+    }
+}
+
 impl Drop for BridgeClient {
     fn drop(&mut self) {
         let _ = self.stop();

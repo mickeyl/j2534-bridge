@@ -1,6 +1,7 @@
 use libloading::{Library, Symbol};
 use serde::{Deserialize, Serialize};
 use std::ffi::{c_char, c_ulong, c_void};
+use std::fmt;
 use std::sync::Mutex;
 use winreg::enums::*;
 use winreg::RegKey;
@@ -177,6 +178,71 @@ pub const ERR_INVALID_DEVICE_ID: i32 = 0x1A;
 pub const RX_CAN_29BIT_ID: u32 = 0x100;
 pub const TX_MSG_TYPE: u32 = 0x01;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum J2534Error {
+    DllLoad(String),
+    FunctionNotFound {
+        function: &'static str,
+        detail: String,
+    },
+    ApiCall {
+        context: &'static str,
+        code: i32,
+        detail: Option<String>,
+    },
+}
+
+impl fmt::Display for J2534Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DllLoad(detail) => write!(f, "ERR_J2534_DLL_LOAD: {}", detail),
+            Self::FunctionNotFound { function, detail } => {
+                write!(f, "ERR_J2534_FUNC_NOT_FOUND: {} - {}", function, detail)
+            }
+            Self::ApiCall {
+                context,
+                code,
+                detail,
+            } => {
+                write!(
+                    f,
+                    "ERR_J2534_{}: error code {} ({})",
+                    context,
+                    code,
+                    error_code_to_string(*code)
+                )?;
+                if let Some(detail) = detail {
+                    write!(f, " - {}", detail)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl std::error::Error for J2534Error {}
+
+fn dll_load_error(err: impl fmt::Display) -> String {
+    J2534Error::DllLoad(err.to_string()).to_string()
+}
+
+fn function_not_found(function: &'static str, err: impl fmt::Display) -> String {
+    J2534Error::FunctionNotFound {
+        function,
+        detail: err.to_string(),
+    }
+    .to_string()
+}
+
+fn api_call_error(context: &'static str, code: i32, library: Option<&Library>) -> String {
+    J2534Error::ApiCall {
+        context,
+        code,
+        detail: library.and_then(get_last_error_message),
+    }
+    .to_string()
+}
+
 fn get_last_error_message(library: &Library) -> Option<String> {
     unsafe {
         let get_last_error_fn: Symbol<PassThruGetLastErrorFn> =
@@ -317,7 +383,8 @@ impl PassThruMsgV0500 {
             if self.data_length < 4 || self.data_buffer.is_null() {
                 return None;
             }
-            let buf = unsafe { std::slice::from_raw_parts(self.data_buffer, self.data_length as usize) };
+            let buf =
+                unsafe { std::slice::from_raw_parts(self.data_buffer, self.data_length as usize) };
             let arb_id = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
             let data = buf[4..].to_vec();
             let extended = (self.rx_status & RX_CAN_29BIT_ID) != 0 || arb_id > 0x7FF;
@@ -335,7 +402,8 @@ impl PassThruMsgV0500 {
             if self.data_length == 0 || self.data_buffer.is_null() {
                 return None;
             }
-            let buf = unsafe { std::slice::from_raw_parts(self.data_buffer, self.data_length as usize) };
+            let buf =
+                unsafe { std::slice::from_raw_parts(self.data_buffer, self.data_length as usize) };
             Some(CANMessage {
                 timestamp_us: self.timestamp as u64,
                 arb_id: 0,
@@ -840,8 +908,7 @@ impl J2534Connection {
             message: Some(dll_path.to_string()),
         });
 
-        let library =
-            unsafe { Library::new(dll_path) }.map_err(|e| format!("ERR_J2534_DLL_LOAD: {}", e))?;
+        let library = unsafe { Library::new(dll_path) }.map_err(dll_load_error)?;
 
         progress_callback(J2534Progress {
             step: "load_dll".to_string(),
@@ -860,15 +927,11 @@ impl J2534Connection {
         unsafe {
             let open_fn: Symbol<PassThruOpenFn> = library
                 .get(b"PassThruOpen\0")
-                .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruOpen - {}", e))?;
+                .map_err(|e| function_not_found("PassThruOpen", e))?;
 
             let result = open_fn(std::ptr::null(), &mut device_id);
             if result != STATUS_NOERROR {
-                return Err(format!(
-                    "ERR_J2534_OPEN_FAILED: error code {} ({})",
-                    result,
-                    error_code_to_string(result)
-                ));
+                return Err(api_call_error("OPEN_FAILED", result, Some(&library)));
             }
         }
 
@@ -893,15 +956,18 @@ impl J2534Connection {
         // Detect v05.00 API (has PassThruScanForDevices) vs v04.04.
         // v05.00 uses different message struct (pointer-based DataBuffer), different
         // filter signature (5-param, no flow control), and renames WriteMsgs to QueueMsgs.
-        let is_v0500 =
-            unsafe { library.get::<*const ()>(b"PassThruScanForDevices\0").is_ok() };
+        let is_v0500 = unsafe {
+            library
+                .get::<*const ()>(b"PassThruScanForDevices\0")
+                .is_ok()
+        };
 
         let can_pins: [c_ulong; 2] = [6, 14]; // CAN_H, CAN_L on J1962
         unsafe {
             let result = if is_v0500 {
                 let connect_fn: Symbol<PassThruConnectV0500Fn> = library
                     .get(b"PassThruConnect\0")
-                    .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruConnect - {}", e))?;
+                    .map_err(|e| function_not_found("PassThruConnect", e))?;
                 connect_fn(
                     device_id,
                     protocol_id as c_ulong,
@@ -913,7 +979,7 @@ impl J2534Connection {
             } else {
                 let connect_fn: Symbol<PassThruConnectFn> = library
                     .get(b"PassThruConnect\0")
-                    .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruConnect - {}", e))?;
+                    .map_err(|e| function_not_found("PassThruConnect", e))?;
                 connect_fn(
                     device_id,
                     protocol_id as c_ulong,
@@ -928,12 +994,12 @@ impl J2534Connection {
                 if let Ok(close_fn) = library.get::<PassThruCloseFn>(b"PassThruClose\0") {
                     close_fn(device_id);
                 }
-                return Err(format!(
-                    "ERR_J2534_CONNECT_FAILED: error code {} ({}){}",
-                    result,
-                    error_code_to_string(result),
-                    last_error.map(|s| format!(" - {}", s)).unwrap_or_default()
-                ));
+                return Err(J2534Error::ApiCall {
+                    context: "CONNECT_FAILED",
+                    code: result,
+                    detail: last_error,
+                }
+                .to_string());
             }
         }
 
@@ -969,10 +1035,9 @@ impl J2534Connection {
 
         if is_kline_protocol {
             unsafe {
-                let filter_fn: Symbol<PassThruStartMsgFilterFn> =
-                    library.get(b"PassThruStartMsgFilter\0").map_err(|e| {
-                        format!("ERR_J2534_FUNC_NOT_FOUND: PassThruStartMsgFilter - {}", e)
-                    })?;
+                let filter_fn: Symbol<PassThruStartMsgFilterFn> = library
+                    .get(b"PassThruStartMsgFilter\0")
+                    .map_err(|e| function_not_found("PassThruStartMsgFilter", e))?;
                 let mut mask_msg = PassThruMsg::default();
                 mask_msg.protocol_id = protocol_id;
                 mask_msg.data_size = 1;
@@ -981,7 +1046,12 @@ impl J2534Connection {
                 pattern_msg.data_size = 1;
                 let mut filter_id: c_ulong = 0;
                 let result = filter_fn(
-                    channel_id, PASS_FILTER, &mask_msg, &pattern_msg, std::ptr::null(), &mut filter_id,
+                    channel_id,
+                    PASS_FILTER,
+                    &mask_msg,
+                    &pattern_msg,
+                    std::ptr::null(),
+                    &mut filter_id,
                 );
                 if result != STATUS_NOERROR {
                     eprintln!(
@@ -1111,13 +1181,23 @@ impl J2534Connection {
                     // Pass-all filter on the 29-bit channel
                     let fres = if is_v0500 {
                         Self::install_filter_v0500(
-                            &library, ch29, PASS_FILTER, protocol_id,
-                            &[0u8; 4], &[0x10, 0xDA, 0xF1, 0x10], CAN_29BIT_ID,
+                            &library,
+                            ch29,
+                            PASS_FILTER,
+                            protocol_id,
+                            &[0u8; 4],
+                            &[0x10, 0xDA, 0xF1, 0x10],
+                            CAN_29BIT_ID,
                         )
                     } else {
                         Self::install_filter_v0404(
-                            &library, ch29, PASS_FILTER, protocol_id,
-                            &[0u8; 4], &[0x10, 0xDA, 0xF1, 0x10], CAN_29BIT_ID,
+                            &library,
+                            ch29,
+                            PASS_FILTER,
+                            protocol_id,
+                            &[0u8; 4],
+                            &[0x10, 0xDA, 0xF1, 0x10],
+                            CAN_29BIT_ID,
                         )
                     };
                     if let Err(e) = fres {
@@ -1215,10 +1295,9 @@ impl J2534Connection {
         tx_flags: u32,
     ) -> Result<u32, String> {
         unsafe {
-            let filter_fn: Symbol<PassThruStartMsgFilterFn> =
-                library.get(b"PassThruStartMsgFilter\0").map_err(|e| {
-                    format!("ERR_J2534_FUNC_NOT_FOUND: PassThruStartMsgFilter - {}", e)
-                })?;
+            let filter_fn: Symbol<PassThruStartMsgFilterFn> = library
+                .get(b"PassThruStartMsgFilter\0")
+                .map_err(|e| function_not_found("PassThruStartMsgFilter", e))?;
             let mut mask_msg = PassThruMsg::default();
             mask_msg.protocol_id = protocol_id;
             mask_msg.tx_flags = tx_flags;
@@ -1243,11 +1322,7 @@ impl J2534Connection {
                 &mut filter_id,
             );
             if result != STATUS_NOERROR {
-                return Err(format!(
-                    "ERR_J2534_FILTER_FAILED: error code {} ({})",
-                    result,
-                    error_code_to_string(result)
-                ));
+                return Err(api_call_error("FILTER_FAILED", result, Some(library)));
             }
             Ok(filter_id as u32)
         }
@@ -1264,10 +1339,9 @@ impl J2534Connection {
         tx_flags: u32,
     ) -> Result<u32, String> {
         unsafe {
-            let filter_fn: Symbol<PassThruStartMsgFilterV0500Fn> =
-                library.get(b"PassThruStartMsgFilter\0").map_err(|e| {
-                    format!("ERR_J2534_FUNC_NOT_FOUND: PassThruStartMsgFilter - {}", e)
-                })?;
+            let filter_fn: Symbol<PassThruStartMsgFilterV0500Fn> = library
+                .get(b"PassThruStartMsgFilter\0")
+                .map_err(|e| function_not_found("PassThruStartMsgFilter", e))?;
             let mask_len = mask.len().min(4128);
             let mut mask_buf = vec![0u8; mask_len];
             mask_buf[..mask_len].copy_from_slice(&mask[..mask_len]);
@@ -1287,19 +1361,9 @@ impl J2534Connection {
             pat_msg.extra_data_index = pat_len as u32;
 
             let mut filter_id: c_ulong = 0;
-            let result = filter_fn(
-                channel_id,
-                filter_type,
-                &mask_msg,
-                &pat_msg,
-                &mut filter_id,
-            );
+            let result = filter_fn(channel_id, filter_type, &mask_msg, &pat_msg, &mut filter_id);
             if result != STATUS_NOERROR {
-                return Err(format!(
-                    "ERR_J2534_FILTER_FAILED: error code {} ({})",
-                    result,
-                    error_code_to_string(result)
-                ));
+                return Err(api_call_error("FILTER_FAILED", result, Some(library)));
             }
             Ok(filter_id as u32)
         }
@@ -1307,7 +1371,9 @@ impl J2534Connection {
 
     /// Resolve the v05.00 write function.  Prefers `PassThruQueueMsgs` (v05.00 name)
     /// and falls back to `PassThruWriteMsgs` with the v05.00 struct layout.
-    fn resolve_write_fn_v0500(library: &Library) -> Result<Symbol<'_, PassThruQueueMsgsFn>, String> {
+    fn resolve_write_fn_v0500(
+        library: &Library,
+    ) -> Result<Symbol<'_, PassThruQueueMsgsFn>, String> {
         unsafe {
             library
                 .get::<PassThruQueueMsgsFn>(b"PassThruQueueMsgs\0")
@@ -1721,10 +1787,10 @@ impl J2534Connection {
             let mut num_msgs: c_ulong = max_msgs as c_ulong;
 
             let result = unsafe {
-                let read_fn: Symbol<PassThruReadMsgsFn> = self
-                    .library
-                    .get(b"PassThruReadMsgs\0")
-                    .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruReadMsgs - {}", e))?;
+                let read_fn: Symbol<PassThruReadMsgsFn> =
+                    self.library.get(b"PassThruReadMsgs\0").map_err(|e| {
+                        format!("ERR_J2534_FUNC_NOT_FOUND: PassThruReadMsgs - {}", e)
+                    })?;
 
                 read_fn(
                     self.channel_id,
@@ -1846,10 +1912,10 @@ impl J2534Connection {
             let mut num_msgs: c_ulong = 16;
 
             unsafe {
-                let read_fn: Symbol<PassThruReadMsgsFn> = self
-                    .library
-                    .get(b"PassThruReadMsgs\0")
-                    .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruReadMsgs - {}", e))?;
+                let read_fn: Symbol<PassThruReadMsgsFn> =
+                    self.library.get(b"PassThruReadMsgs\0").map_err(|e| {
+                        format!("ERR_J2534_FUNC_NOT_FOUND: PassThruReadMsgs - {}", e)
+                    })?;
 
                 let result = read_fn(
                     self.channel_id,
@@ -1860,10 +1926,7 @@ impl J2534Connection {
 
                 // Allow STATUS_NOERROR, ERR_BUFFER_EMPTY, and ERR_TIMEOUT
                 // ERR_TIMEOUT can still return messages (e.g., ScanDoc WiFi adapter)
-                if result != STATUS_NOERROR
-                    && result != ERR_BUFFER_EMPTY
-                    && result != ERR_TIMEOUT
-                {
+                if result != STATUS_NOERROR && result != ERR_BUFFER_EMPTY && result != ERR_TIMEOUT {
                     return Err(format!(
                         "ERR_J2534_READ_FAILED: error code {} ({})",
                         result,
@@ -1983,14 +2046,11 @@ impl J2534Connection {
             let read_fn = unsafe {
                 self.library
                     .get::<PassThruReadMsgsV0500Fn>(b"PassThruReadMsgs\0")
-                    .map_err(|e| {
-                        format!("ERR_J2534_FUNC_NOT_FOUND: PassThruReadMsgs - {}", e)
-                    })?
+                    .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruReadMsgs - {}", e))?
             };
 
             // Allocate backing buffers once, reused across iterations
-            let mut backing_bufs: Vec<Vec<u8>> =
-                (0..batch_size).map(|_| vec![0u8; 4128]).collect();
+            let mut backing_bufs: Vec<Vec<u8>> = (0..batch_size).map(|_| vec![0u8; 4128]).collect();
 
             for iteration in 0..max_drain_reads {
                 let t = if iteration == 0 { timeout_ms } else { 0 };
@@ -2006,20 +2066,11 @@ impl J2534Connection {
                     .collect();
                 let mut num_msgs = batch_size as c_ulong;
 
-                let result = unsafe {
-                    read_fn(
-                        self.channel_id,
-                        msg_buffer.as_mut_ptr(),
-                        &mut num_msgs,
-                        t,
-                    )
-                };
+                let result =
+                    unsafe { read_fn(self.channel_id, msg_buffer.as_mut_ptr(), &mut num_msgs, t) };
 
                 // Allow STATUS_NOERROR, ERR_BUFFER_EMPTY, and ERR_TIMEOUT
-                if result != STATUS_NOERROR
-                    && result != ERR_BUFFER_EMPTY
-                    && result != ERR_TIMEOUT
-                {
+                if result != STATUS_NOERROR && result != ERR_BUFFER_EMPTY && result != ERR_TIMEOUT {
                     if iteration == 0 {
                         return Err(format!(
                             "ERR_J2534_READ_FAILED: error code {} ({})",
@@ -2093,9 +2144,8 @@ impl J2534Connection {
                         .collect();
                     let mut num_msgs = batch_size as c_ulong;
 
-                    let result = unsafe {
-                        read_fn(ch29, msg_buffer_29.as_mut_ptr(), &mut num_msgs, 0)
-                    };
+                    let result =
+                        unsafe { read_fn(ch29, msg_buffer_29.as_mut_ptr(), &mut num_msgs, 0) };
 
                     if result != STATUS_NOERROR
                         && result != ERR_BUFFER_EMPTY
@@ -2154,29 +2204,18 @@ impl J2534Connection {
             let read_fn = unsafe {
                 self.library
                     .get::<PassThruReadMsgsFn>(b"PassThruReadMsgs\0")
-                    .map_err(|e| {
-                        format!("ERR_J2534_FUNC_NOT_FOUND: PassThruReadMsgs - {}", e)
-                    })?
+                    .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruReadMsgs - {}", e))?
             };
 
             for iteration in 0..max_drain_reads {
                 let t = if iteration == 0 { timeout_ms } else { 0 };
                 let mut num_msgs = batch_size as c_ulong;
 
-                let result = unsafe {
-                    read_fn(
-                        self.channel_id,
-                        msg_buffer.as_mut_ptr(),
-                        &mut num_msgs,
-                        t,
-                    )
-                };
+                let result =
+                    unsafe { read_fn(self.channel_id, msg_buffer.as_mut_ptr(), &mut num_msgs, t) };
 
                 // Allow STATUS_NOERROR, ERR_BUFFER_EMPTY, and ERR_TIMEOUT
-                if result != STATUS_NOERROR
-                    && result != ERR_BUFFER_EMPTY
-                    && result != ERR_TIMEOUT
-                {
+                if result != STATUS_NOERROR && result != ERR_BUFFER_EMPTY && result != ERR_TIMEOUT {
                     if iteration == 0 {
                         return Err(format!(
                             "ERR_J2534_READ_FAILED: error code {} ({})",
@@ -2213,13 +2252,12 @@ impl J2534Connection {
                         ]);
                         let data_len = (msg.data_size - 4) as usize;
                         let data = msg.data[4..4 + data_len].to_vec();
-                        let extended =
-                            (msg.rx_status & RX_CAN_29BIT_ID) != 0 || arb_id > 0x7FF;
+                        let extended = (msg.rx_status & RX_CAN_29BIT_ID) != 0 || arb_id > 0x7FF;
 
                         // Driver workaround: filter TX echoes by matching sent_messages
                         let is_echo = if let Ok(mut sent) = self.sent_messages.lock() {
-                            let cutoff = std::time::Instant::now()
-                                - std::time::Duration::from_millis(500);
+                            let cutoff =
+                                std::time::Instant::now() - std::time::Duration::from_millis(500);
                             sent.retain(|m| m.timestamp > cutoff);
 
                             if let Some(pos) = sent
@@ -2283,9 +2321,8 @@ impl J2534Connection {
 
                 for _ in 0..max_drain_reads {
                     let mut num_msgs = batch_size as c_ulong;
-                    let result = unsafe {
-                        read_fn(ch29, msg_buffer_29.as_mut_ptr(), &mut num_msgs, 0)
-                    };
+                    let result =
+                        unsafe { read_fn(ch29, msg_buffer_29.as_mut_ptr(), &mut num_msgs, 0) };
 
                     if result != STATUS_NOERROR
                         && result != ERR_BUFFER_EMPTY
@@ -2318,8 +2355,8 @@ impl J2534Connection {
                         let extended = true;
 
                         let is_echo = if let Ok(mut sent) = self.sent_messages.lock() {
-                            let cutoff = std::time::Instant::now()
-                                - std::time::Duration::from_millis(500);
+                            let cutoff =
+                                std::time::Instant::now() - std::time::Duration::from_millis(500);
                             sent.retain(|m| m.timestamp > cutoff);
                             if let Some(pos) = sent
                                 .iter()
@@ -2548,8 +2585,7 @@ impl J2534Connection {
                     .map_err(|e| {
                         format!("ERR_J2534_FUNC_NOT_FOUND: PassThruStartPeriodicMsg - {}", e)
                     })?;
-                let result =
-                    start_periodic_fn(self.channel_id, &msg, &mut msg_id, interval_ms);
+                let result = start_periodic_fn(self.channel_id, &msg, &mut msg_id, interval_ms);
                 if result != STATUS_NOERROR {
                     return Err(format!(
                         "ERR_J2534_START_PERIODIC_FAILED: error code {} ({})",
@@ -2577,8 +2613,7 @@ impl J2534Connection {
                     .map_err(|e| {
                         format!("ERR_J2534_FUNC_NOT_FOUND: PassThruStartPeriodicMsg - {}", e)
                     })?;
-                let result =
-                    start_periodic_fn(self.channel_id, &msg, &mut msg_id, interval_ms);
+                let result = start_periodic_fn(self.channel_id, &msg, &mut msg_id, interval_ms);
                 if result != STATUS_NOERROR {
                     return Err(format!(
                         "ERR_J2534_START_PERIODIC_FAILED: error code {} ({})",
@@ -2661,13 +2696,23 @@ impl J2534Connection {
         let tx_flags = if extended { CAN_29BIT_ID } else { 0 };
         if self.is_v0500 {
             Self::install_filter_v0500(
-                &self.library, self.channel_id, filter_type,
-                self.protocol_id, &mask4, &pat4, tx_flags,
+                &self.library,
+                self.channel_id,
+                filter_type,
+                self.protocol_id,
+                &mask4,
+                &pat4,
+                tx_flags,
             )
         } else {
             Self::install_filter_v0404(
-                &self.library, self.channel_id, filter_type,
-                self.protocol_id, &mask4, &pat4, tx_flags,
+                &self.library,
+                self.channel_id,
+                filter_type,
+                self.protocol_id,
+                &mask4,
+                &pat4,
+                tx_flags,
             )
         }
     }
@@ -2690,13 +2735,23 @@ impl J2534Connection {
         let tx_flags = if extended { CAN_29BIT_ID } else { 0 };
         if self.is_v0500 {
             Self::install_filter_v0500(
-                &self.library, self.channel_id, filter_type,
-                self.protocol_id, &mask[..mask_len], &pattern[..pattern_len], tx_flags,
+                &self.library,
+                self.channel_id,
+                filter_type,
+                self.protocol_id,
+                &mask[..mask_len],
+                &pattern[..pattern_len],
+                tx_flags,
             )
         } else {
             Self::install_filter_v0404(
-                &self.library, self.channel_id, filter_type,
-                self.protocol_id, &mask[..mask_len], &pattern[..pattern_len], tx_flags,
+                &self.library,
+                self.channel_id,
+                filter_type,
+                self.protocol_id,
+                &mask[..mask_len],
+                &pattern[..pattern_len],
+                tx_flags,
             )
         }
     }
@@ -3090,16 +3145,93 @@ impl Drop for J2534Connection {
 #[cfg(test)]
 mod v0500_layout_tests {
     use super::*;
-    
+
     #[test]
     fn v0500_msg_layout() {
-        assert_eq!(std::mem::size_of::<PassThruMsgV0500>(), 40, "v0500 msg must be 40 bytes (packed)");
-        
+        assert_eq!(
+            std::mem::size_of::<PassThruMsgV0500>(),
+            40,
+            "v0500 msg must be 40 bytes (packed)"
+        );
+
         let mut buf = vec![0u8; 80];
         let msg = PassThruMsgV0500::new(&mut buf);
         let base = &msg as *const _ as usize;
         assert_eq!(std::ptr::addr_of!(msg.protocol_id) as usize - base, 0);
-        assert_eq!(std::ptr::addr_of!(msg.data_buffer) as usize - base, 28, "data_buffer must be at offset 28 (packed)");
+        assert_eq!(
+            std::ptr::addr_of!(msg.data_buffer) as usize - base,
+            28,
+            "data_buffer must be at offset 28 (packed)"
+        );
         assert_eq!(std::ptr::addr_of!(msg.data_buffer_size) as usize - base, 36);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_code_to_string_covers_known_and_unknown_values() {
+        assert_eq!(error_code_to_string(STATUS_NOERROR), "STATUS_NOERROR");
+        assert_eq!(error_code_to_string(ERR_TIMEOUT), "ERR_TIMEOUT");
+        assert_eq!(error_code_to_string(-1234), "UNKNOWN_ERROR");
+    }
+
+    #[test]
+    fn protocol_id_to_string_covers_known_and_unknown_values() {
+        assert_eq!(protocol_id_to_string(PROTOCOL_CAN), "CAN");
+        assert_eq!(protocol_id_to_string(PROTOCOL_ISO14230), "ISO14230");
+        assert_eq!(protocol_id_to_string(999), "UNKNOWN");
+    }
+
+    #[test]
+    fn passthru_can_messages_extract_header_and_payload() {
+        let mut msg = PassThruMsg::default();
+        msg.protocol_id = PROTOCOL_CAN;
+        msg.rx_status = RX_CAN_29BIT_ID;
+        msg.timestamp = 1234;
+        msg.data_size = 7;
+        msg.data[..7].copy_from_slice(&[0x18, 0xDA, 0xF1, 0x10, 0x22, 0xF1, 0x90]);
+
+        let can = passthru_msg_to_can_message(&msg);
+
+        assert_eq!(can.timestamp_us, 1234);
+        assert_eq!(can.arb_id, 0x18DAF110);
+        assert!(can.extended);
+        assert_eq!(can.data, vec![0x22, 0xF1, 0x90]);
+        assert_eq!(can.raw_arb_id, 0x18DAF110);
+        assert_eq!(can.protocol_id, PROTOCOL_CAN);
+    }
+
+    #[test]
+    fn passthru_non_can_messages_preserve_raw_payload() {
+        let mut msg = PassThruMsg::default();
+        msg.protocol_id = PROTOCOL_ISO14230;
+        msg.timestamp = 55;
+        msg.data_size = 3;
+        msg.data[..3].copy_from_slice(&[0x83, 0xF1, 0x01]);
+
+        let can = passthru_msg_to_can_message(&msg);
+
+        assert_eq!(can.timestamp_us, 55);
+        assert_eq!(can.arb_id, 0);
+        assert!(!can.extended);
+        assert_eq!(can.data, vec![0x83, 0xF1, 0x01]);
+        assert_eq!(can.protocol_id, PROTOCOL_ISO14230);
+    }
+
+    #[test]
+    fn custom_error_formats_include_context() {
+        let error = J2534Error::ApiCall {
+            context: "CONNECT_FAILED",
+            code: ERR_TIMEOUT,
+            detail: Some("device not responding".to_string()),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "ERR_J2534_CONNECT_FAILED: error code 9 (ERR_TIMEOUT) - device not responding"
+        );
     }
 }

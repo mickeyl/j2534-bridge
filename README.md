@@ -1,5 +1,9 @@
 # j2534-bridge
 
+[![CI](https://github.com/mickeyl/j2534-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/mickeyl/j2534-bridge/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
+
 Out-of-process J2534 PassThru bridge for cross-bitness DLL loading and fault isolation.
 
 ## What it does
@@ -51,7 +55,7 @@ Host applications depend on the library for `client` and `protocol` modules:
 
 ```toml
 [dependencies]
-j2534-bridge = { path = "../j2534-bridge" }
+j2534-bridge = "0.1.0"
 ```
 
 ```rust
@@ -69,6 +73,9 @@ for msg in &messages {
 bridge.close_connection()?;
 bridge.stop()?;
 ```
+
+Copy the built bridge executables to your application directory so the client can
+launch the matching 32-bit or 64-bit helper at runtime.
 
 ## Building
 
@@ -169,6 +176,14 @@ If you need 29-bit capture with OBDX, contact the vendor for a driver update.
 ## Diagnostics
 
 Set `J2534_BRIDGE_VERBOSE=1` to log all requests and responses to stderr.
+
+## Contributing
+
+Run `cargo fmt` and `cargo clippy` before submitting a PR.
+
+Add tests for new features.
+
+Follow Rust best practices.
 
 ## License
 
