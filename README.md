@@ -1,8 +1,10 @@
 # j2534-bridge
 
 [![CI](https://github.com/mickeyl/j2534-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/mickeyl/j2534-bridge/actions/workflows/ci.yml)
+[![GitHub release](https://img.shields.io/github/v/tag/mickeyl/j2534-bridge?label=release&sort=semver)](https://github.com/mickeyl/j2534-bridge/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
+[![Platform: Windows](https://img.shields.io/badge/platform-Windows-blue.svg)](https://github.com/mickeyl/j2534-bridge)
 
 Out-of-process J2534 PassThru bridge for cross-bitness DLL loading and fault isolation.
 
