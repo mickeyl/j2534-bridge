@@ -6,9 +6,7 @@ use std::sync::Mutex;
 use winreg::enums::*;
 use winreg::RegKey;
 
-// J2534 Protocol IDs
-// Note: Only CAN protocol is supported. Other protocols (ISO15765, ISO9141, etc.)
-// are optional in the J2534 spec, so adapter support is inconsistent.
+// J2534 v04.04 Protocol IDs (used internally throughout the bridge)
 #[allow(dead_code)]
 pub const PROTOCOL_J1850VPW: u32 = 1;
 #[allow(dead_code)]
@@ -28,6 +26,40 @@ pub const PROTOCOL_SCI_A_TRANS: u32 = 8;
 pub const PROTOCOL_SCI_B_ENGINE: u32 = 9;
 #[allow(dead_code)]
 pub const PROTOCOL_SCI_B_TRANS: u32 = 10;
+
+// J2534 v05.00 Protocol IDs (bitmask-based, different from v04.04)
+const V0500_J1850VPW: u32 = 0x01;
+const V0500_J1850PWM: u32 = 0x02;
+const V0500_ISO9141: u32 = 0x04;
+const V0500_ISO14230: u32 = 0x08;
+const V0500_CAN: u32 = 0x10;
+const V0500_ISO15765: u32 = 0x200;
+
+/// Translate v04.04 protocol ID to v05.00 for DLL calls.
+fn protocol_v0404_to_v0500(id: u32) -> u32 {
+    match id {
+        1 => V0500_J1850VPW,
+        2 => V0500_J1850PWM,
+        3 => V0500_ISO9141,
+        4 => V0500_ISO14230,
+        5 => V0500_CAN,
+        6 => V0500_ISO15765,
+        _ => id, // pass through unknown IDs
+    }
+}
+
+/// Translate v05.00 protocol ID back to v04.04 for internal use.
+fn protocol_v0500_to_v0404(id: u32) -> u32 {
+    match id {
+        V0500_J1850VPW => 1,
+        V0500_J1850PWM => 2,
+        V0500_ISO9141 => 3,
+        V0500_ISO14230 => 4,
+        V0500_CAN => 5,
+        V0500_ISO15765 => 6,
+        _ => id,
+    }
+}
 
 // J2534 Connect Flags
 pub const CAN_29BIT_ID: u32 = 0x100;
@@ -885,7 +917,12 @@ pub struct J2534Connection {
     /// Optional second channel for 29-bit CAN IDs (used when CAN_ID_BOTH is
     /// not supported by the adapter — we fall back to dual channels).
     channel_id_29bit: Option<u32>,
+    /// Internal protocol ID (v04.04 numbering: CAN=5, ISO15765=6, etc.)
     protocol_id: u32,
+    /// Protocol ID as expected by the loaded DLL.  For v04.04 DLLs this is
+    /// identical to `protocol_id`; for v05.00 DLLs it is the translated
+    /// bitmask value (CAN=0x10, ISO15765=0x200, etc.).
+    dll_protocol_id: u32,
     /// True when the DLL exports v05.00 symbols (PassThruScanForDevices).
     /// Controls which message struct and calling conventions are used.
     is_v0500: bool,
@@ -963,6 +1000,12 @@ impl J2534Connection {
         };
 
         let can_pins: [c_ulong; 2] = [6, 14]; // CAN_H, CAN_L on J1962
+        // v05.00 uses different protocol ID values; translate at the DLL boundary
+        let dll_protocol_id = if is_v0500 {
+            protocol_v0404_to_v0500(protocol_id)
+        } else {
+            protocol_id
+        };
         unsafe {
             let result = if is_v0500 {
                 let connect_fn: Symbol<PassThruConnectV0500Fn> = library
@@ -970,7 +1013,7 @@ impl J2534Connection {
                     .map_err(|e| function_not_found("PassThruConnect", e))?;
                 connect_fn(
                     device_id,
-                    protocol_id as c_ulong,
+                    dll_protocol_id as c_ulong,
                     flags as c_ulong,
                     baud_rate as c_ulong,
                     can_j1962_resource(&can_pins),
@@ -1039,10 +1082,10 @@ impl J2534Connection {
                     .get(b"PassThruStartMsgFilter\0")
                     .map_err(|e| function_not_found("PassThruStartMsgFilter", e))?;
                 let mut mask_msg = PassThruMsg::default();
-                mask_msg.protocol_id = protocol_id;
+                mask_msg.protocol_id = dll_protocol_id;
                 mask_msg.data_size = 1;
                 let mut pattern_msg = PassThruMsg::default();
-                pattern_msg.protocol_id = protocol_id;
+                pattern_msg.protocol_id = dll_protocol_id;
                 pattern_msg.data_size = 1;
                 let mut filter_id: c_ulong = 0;
                 let result = filter_fn(
@@ -1075,7 +1118,7 @@ impl J2534Connection {
                     &library,
                     channel_id,
                     PASS_FILTER,
-                    protocol_id,
+                    dll_protocol_id,
                     &[0u8; 4],
                     &[0u8; 4],
                     0,
@@ -1085,7 +1128,7 @@ impl J2534Connection {
                     &library,
                     channel_id,
                     PASS_FILTER,
-                    protocol_id,
+                    dll_protocol_id,
                     &[0u8; 4],
                     &[0u8; 4],
                     0,
@@ -1112,7 +1155,7 @@ impl J2534Connection {
                         &library,
                         channel_id,
                         PASS_FILTER,
-                        protocol_id,
+                        dll_protocol_id,
                         &[0u8; 4],
                         &[0x10, 0xDA, 0xF1, 0x10],
                         CAN_29BIT_ID,
@@ -1122,7 +1165,7 @@ impl J2534Connection {
                         &library,
                         channel_id,
                         PASS_FILTER,
-                        protocol_id,
+                        dll_protocol_id,
                         &[0u8; 4],
                         &[0x10, 0xDA, 0xF1, 0x10],
                         CAN_29BIT_ID,
@@ -1156,7 +1199,7 @@ impl J2534Connection {
                 cfn.map(|f| unsafe {
                     f(
                         device_id,
-                        protocol_id as c_ulong,
+                        dll_protocol_id as c_ulong,
                         CAN_29BIT_ID as c_ulong,
                         baud_rate as c_ulong,
                         can_j1962_resource(&can_pins_29),
@@ -1184,7 +1227,7 @@ impl J2534Connection {
                             &library,
                             ch29,
                             PASS_FILTER,
-                            protocol_id,
+                            dll_protocol_id,
                             &[0u8; 4],
                             &[0x10, 0xDA, 0xF1, 0x10],
                             CAN_29BIT_ID,
@@ -1194,7 +1237,7 @@ impl J2534Connection {
                             &library,
                             ch29,
                             PASS_FILTER,
-                            protocol_id,
+                            dll_protocol_id,
                             &[0u8; 4],
                             &[0x10, 0xDA, 0xF1, 0x10],
                             CAN_29BIT_ID,
@@ -1227,6 +1270,7 @@ impl J2534Connection {
             channel_id,
             channel_id_29bit,
             protocol_id,
+            dll_protocol_id,
             is_v0500,
             sent_messages: Mutex::new(Vec::new()),
         };
@@ -1425,7 +1469,7 @@ impl J2534Connection {
             Self::build_v0500_can_msg(&mut buf, self.protocol_id, arb_id, data, extended);
             data_len = if is_can { data.len().min(8) } else { buf.len() };
             let mut msg = PassThruMsgV0500::new(&mut buf);
-            msg.protocol_id = self.protocol_id;
+            msg.protocol_id = self.dll_protocol_id;
             msg.tx_flags = if is_can && extended { CAN_29BIT_ID } else { 0 };
             msg.data_length = buf.len() as u32;
             msg.extra_data_index = buf.len() as u32;
@@ -1441,7 +1485,7 @@ impl J2534Connection {
             }
         } else {
             let mut msg = PassThruMsg::default();
-            msg.protocol_id = self.protocol_id;
+            msg.protocol_id = self.dll_protocol_id;
             data_len = if is_can {
                 msg.tx_flags = if extended { CAN_29BIT_ID } else { 0 };
                 msg.data[0] = ((arb_id >> 24) & 0xFF) as u8;
@@ -1520,7 +1564,7 @@ impl J2534Connection {
                 .zip(messages.iter())
                 .map(|(buf, (_arb_id, _data, extended))| {
                     let mut msg = PassThruMsgV0500::new(buf);
-                    msg.protocol_id = self.protocol_id;
+                    msg.protocol_id = self.dll_protocol_id;
                     msg.data_length = buf.len() as u32;
                     msg.extra_data_index = buf.len() as u32;
                     msg.tx_flags = if is_can && *extended { CAN_29BIT_ID } else { 0 };
@@ -1553,7 +1597,7 @@ impl J2534Connection {
                 .iter()
                 .map(|(arb_id, data, extended)| {
                     let mut msg = PassThruMsg::default();
-                    msg.protocol_id = self.protocol_id;
+                    msg.protocol_id = self.dll_protocol_id;
                     if is_can {
                         msg.tx_flags = if *extended { CAN_29BIT_ID } else { 0 };
                         msg.data[0] = ((arb_id >> 24) & 0xFF) as u8;
@@ -1656,7 +1700,7 @@ impl J2534Connection {
                 .zip(messages.iter())
                 .map(|(buf, (_arb_id, _data, extended))| {
                     let mut msg = PassThruMsgV0500::new(buf);
-                    msg.protocol_id = self.protocol_id;
+                    msg.protocol_id = self.dll_protocol_id;
                     msg.data_length = buf.len() as u32;
                     msg.extra_data_index = buf.len() as u32;
                     msg.tx_flags = if is_can && *extended { CAN_29BIT_ID } else { 0 };
@@ -1679,7 +1723,7 @@ impl J2534Connection {
                 .iter()
                 .map(|(arb_id, data, extended)| {
                     let mut msg = PassThruMsg::default();
-                    msg.protocol_id = self.protocol_id;
+                    msg.protocol_id = self.dll_protocol_id;
                     if is_can {
                         msg.tx_flags = if *extended { CAN_29BIT_ID } else { 0 };
                         msg.data[0] = ((arb_id >> 24) & 0xFF) as u8;
@@ -1753,7 +1797,7 @@ impl J2534Connection {
                 .iter_mut()
                 .map(|buf| {
                     let mut msg = PassThruMsgV0500::new(buf);
-                    msg.protocol_id = self.protocol_id;
+                    msg.protocol_id = self.dll_protocol_id;
                     msg
                 })
                 .collect();
@@ -1831,7 +1875,7 @@ impl J2534Connection {
                 .iter_mut()
                 .map(|buf| {
                     let mut msg = PassThruMsgV0500::new(buf);
-                    msg.protocol_id = self.protocol_id;
+                    msg.protocol_id = self.dll_protocol_id;
                     msg
                 })
                 .collect();
@@ -2060,7 +2104,7 @@ impl J2534Connection {
                     .iter_mut()
                     .map(|buf| {
                         let mut msg = PassThruMsgV0500::new(buf);
-                        msg.protocol_id = self.protocol_id;
+                        msg.protocol_id = self.dll_protocol_id;
                         msg
                     })
                     .collect();
@@ -2138,7 +2182,7 @@ impl J2534Connection {
                         .iter_mut()
                         .map(|buf| {
                             let mut msg = PassThruMsgV0500::new(buf);
-                            msg.protocol_id = self.protocol_id;
+                            msg.protocol_id = self.dll_protocol_id;
                             msg
                         })
                         .collect();
@@ -2573,7 +2617,7 @@ impl J2534Connection {
             let mut buf = Vec::with_capacity(12);
             Self::build_v0500_can_msg(&mut buf, self.protocol_id, arb_id, data, extended);
             let mut msg = PassThruMsgV0500::new(&mut buf);
-            msg.protocol_id = self.protocol_id;
+            msg.protocol_id = self.dll_protocol_id;
             msg.tx_flags = if extended { CAN_29BIT_ID } else { 0 };
             msg.data_length = buf.len() as u32;
             msg.extra_data_index = buf.len() as u32;
@@ -2596,7 +2640,7 @@ impl J2534Connection {
             }
         } else {
             let mut msg = PassThruMsg::default();
-            msg.protocol_id = self.protocol_id;
+            msg.protocol_id = self.dll_protocol_id;
             msg.tx_flags = if extended { CAN_29BIT_ID } else { 0 };
             msg.data[0] = ((arb_id >> 24) & 0xFF) as u8;
             msg.data[1] = ((arb_id >> 16) & 0xFF) as u8;
@@ -2699,7 +2743,7 @@ impl J2534Connection {
                 &self.library,
                 self.channel_id,
                 filter_type,
-                self.protocol_id,
+                self.dll_protocol_id,
                 &mask4,
                 &pat4,
                 tx_flags,
@@ -2709,7 +2753,7 @@ impl J2534Connection {
                 &self.library,
                 self.channel_id,
                 filter_type,
-                self.protocol_id,
+                self.dll_protocol_id,
                 &mask4,
                 &pat4,
                 tx_flags,
@@ -2738,7 +2782,7 @@ impl J2534Connection {
                 &self.library,
                 self.channel_id,
                 filter_type,
-                self.protocol_id,
+                self.dll_protocol_id,
                 &mask[..mask_len],
                 &pattern[..pattern_len],
                 tx_flags,
@@ -2748,7 +2792,7 @@ impl J2534Connection {
                 &self.library,
                 self.channel_id,
                 filter_type,
-                self.protocol_id,
+                self.dll_protocol_id,
                 &mask[..mask_len],
                 &pattern[..pattern_len],
                 tx_flags,
@@ -2891,11 +2935,11 @@ impl J2534Connection {
         if self.is_v0500 {
             let mut in_buf = data.to_vec();
             let mut input = PassThruMsgV0500::new(&mut in_buf);
-            input.protocol_id = self.protocol_id;
+            input.protocol_id = self.dll_protocol_id;
             input.data_length = data.len() as u32;
             let mut out_buf = vec![0u8; 4128];
             let mut output = PassThruMsgV0500::new(&mut out_buf);
-            output.protocol_id = self.protocol_id;
+            output.protocol_id = self.dll_protocol_id;
 
             unsafe {
                 let ioctl_fn: Symbol<PassThruIoctlFn> = self
@@ -2924,7 +2968,7 @@ impl J2534Connection {
                 .ok_or_else(|| "ERR_J2534_FAST_INIT_FAILED: empty response".to_string())
         } else {
             let mut input = PassThruMsg::default();
-            input.protocol_id = self.protocol_id;
+            input.protocol_id = self.dll_protocol_id;
             input.data_size = data.len() as u32;
             input.data[..data.len()].copy_from_slice(data);
             let mut output = PassThruMsg::default();
