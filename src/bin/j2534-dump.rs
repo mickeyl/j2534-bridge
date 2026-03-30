@@ -936,6 +936,7 @@ mod app {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn format_candump_line(
         msg: &CanMessage,
         interface: &str,

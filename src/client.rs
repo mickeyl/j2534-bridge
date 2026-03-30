@@ -240,7 +240,7 @@ impl BridgeClient {
         .map_err(|e| format!("Failed to connect to pipe: {}", e))?;
 
         // Convert to std::fs::File
-        let handle_raw = pipe_handle.0 as *mut std::ffi::c_void;
+        let handle_raw = pipe_handle.0;
         let file = unsafe { std::fs::File::from_raw_handle(handle_raw) };
 
         let reader_file = file

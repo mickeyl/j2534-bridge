@@ -89,7 +89,7 @@ fn run_bridge(pipe_name: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("[bridge] Client connected");
 
-    let handle_raw = pipe_handle.0 as *mut std::ffi::c_void;
+    let handle_raw = pipe_handle.0;
     let file = unsafe { std::fs::File::from_raw_handle(handle_raw) };
 
     message_loop(file)
