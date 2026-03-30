@@ -48,7 +48,6 @@ fn protocol_v0404_to_v0500(id: u32) -> u32 {
     }
 }
 
-
 // J2534 Connect Flags
 pub const CAN_29BIT_ID: u32 = 0x100;
 #[allow(dead_code)]
@@ -988,7 +987,7 @@ impl J2534Connection {
         };
 
         let can_pins: [c_ulong; 2] = [6, 14]; // CAN_H, CAN_L on J1962
-        // v05.00 uses different protocol ID values; translate at the DLL boundary
+                                              // v05.00 uses different protocol ID values; translate at the DLL boundary
         let dll_protocol_id = if is_v0500 {
             protocol_v0404_to_v0500(protocol_id)
         } else {
@@ -1905,7 +1904,6 @@ impl J2534Connection {
             }
 
             for msg in msg_buffer.iter().take(num_msgs as usize) {
-
                 // Skip TX echo messages (loopback) - these have TX_MSG_TYPE flag set
                 // Unless include_loopback is true (for sanity testing)
                 if !include_loopback && (msg.rx_status & TX_MSG_TYPE) != 0 {
@@ -1978,7 +1976,6 @@ impl J2534Connection {
             }
 
             for msg in msg_buffer.iter().take(num_msgs as usize) {
-
                 // Skip TX echo messages (loopback) - these have TX_MSG_TYPE flag set
                 // Unless include_loopback is true (for sanity testing)
                 if !include_loopback && (msg.rx_status & TX_MSG_TYPE) != 0 {
@@ -2127,7 +2124,6 @@ impl J2534Connection {
                 }
 
                 for msg in msg_buffer.iter().take(num_msgs as usize) {
-
                     // Skip TX echoes by flag
                     if (msg.rx_status & TX_MSG_TYPE) != 0 {
                         continue;
@@ -2270,7 +2266,6 @@ impl J2534Connection {
                 }
 
                 for msg in msg_buffer.iter().take(num_msgs as usize) {
-
                     // Skip TX echoes by flag
                     if (msg.rx_status & TX_MSG_TYPE) != 0 {
                         continue;
