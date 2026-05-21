@@ -1,6 +1,6 @@
 [package]
 name = "j2534-bridge"
-version = "1.0.0"
+version = "0.1.0"
 edition = "2021"
 description = "Out-of-process J2534 PassThru bridge for cross-bitness DLL loading and fault isolation."
 license = "MIT"
@@ -33,6 +33,10 @@ windows = { version = "0.58", features = [
     "Win32_Security",
     "Win32_Storage_FileSystem",
 ] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+rusb = "0.9"
+libusb1-sys = { version = "0.7", features = ["vendored"] }
 
 [profile.release]
 opt-level = "z"

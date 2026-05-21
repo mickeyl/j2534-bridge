@@ -4,7 +4,7 @@ CARGO ?= cargo
 BUILD_TARGET :=
 WIN32_TARGET := i686-pc-windows-msvc
 WIN64_TARGET := x86_64-pc-windows-msvc
-DEV_BIN_DIR := ../CANcorder/src-tauri/bin
+DEV_BIN_DIR := ../../apps/cancorder/src-tauri/bin
 DEVICE ?=
 DLL ?=
 BITNESS ?=
@@ -38,7 +38,7 @@ endif
 
 DUMP = $(CARGO) run --bin j2534-dump -- $(SELECTOR) $(BITNESS_ARG) --baud-rate $(BAUD) --timeout-ms $(TIMEOUT_MS) --batch-size $(BATCH_SIZE) --max-drain-reads $(MAX_DRAIN_READS) --interface $(INTERFACE)
 
-.PHONY: help test build ensure-bridge ensure-bridge-dev publish-dev list dump dump-std dump-ext dump-both dump-loopback dump-stress-loopback dump-raw dump-isotp native-build native-list native-rx native-rx-hybrid native-rx-v5-6param native-rx-nofilter
+.PHONY: help test build ensure-bridge ensure-bridge-dev publish-dev list macos-can-usb-list dump dump-std dump-ext dump-both dump-loopback dump-stress-loopback dump-raw dump-isotp native-build native-list native-rx native-rx-hybrid native-rx-v5-6param native-rx-nofilter
 
 help:
 	@echo "j2534-bridge test presets"
@@ -49,11 +49,12 @@ help:
 	@echo "  BITNESS=32|64            Override bridge bitness"
 	@echo "  BAUD=500000              Bus speed"
 	@echo "  DURATION=10              Capture length in seconds"
-	@echo "  EXTRA='...'              Extra args passed to j2534-dump"
+	@echo "  EXTRA='...'              Extra args passed to CLI tools"
 	@echo ""
 	@echo "Targets:"
 	@echo "  make test                  Run fmt, clippy, and library unit tests (refuses on macOS)"
 	@echo "  make list"
+	@echo "  make macos-can-usb-list    List USB CAN adapters detected on macOS"
 	@echo "  make ensure-bridge-dev     Build and publish fresh dev bridge binaries for CANcorder"
 	@echo "  make native-build          Build standalone C J2534 v5.0 test harness"
 	@echo "  make native-list           Enumerate devices through the native C harness"
@@ -94,7 +95,10 @@ list: ensure-bridge
 	$(CARGO) run --bin j2534-dump -- $(BITNESS_ARG) --list
 
 build:
-	$(CARGO) build $(BUILD_TARGET) --bin j2534-bridge --bin j2534-dump
+	$(CARGO) build $(BUILD_TARGET) --bin j2534-bridge --bin j2534-dump --bin macos-can-usb-list
+
+macos-can-usb-list:
+	$(CARGO) run --bin macos-can-usb-list -- $(EXTRA)
 
 native-build:
 	powershell -ExecutionPolicy Bypass -File .\scripts\build-native-j2534-test.ps1 -Arch x64

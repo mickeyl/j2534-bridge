@@ -110,10 +110,10 @@ impl BridgeClient {
 
         // Try debug build first so local development picks up the freshly built bridge.
         for build_type in &["debug", "release"] {
-            // Support three development layouts:
+            // Support development layouts used by CANsole and the former standalone app:
             // 1. Running inside j2534-bridge itself: target/debug/j2534-dump.exe
-            // 2. From a sibling app crate in the same workspace
-            // 3. From a separate repo pointing at ../j2534-bridge
+            // 2. From CANsole apps/cancorder/src-tauri
+            // 3. From the former CANcorder submodule/sibling layouts
             let candidates = [
                 // Local crate native build: only valid when requested bitness matches this process.
                 exe_dir.parent().and_then(|p| {
@@ -156,6 +156,22 @@ impl BridgeClient {
                             .join("j2534-bridge.exe")
                     })
                 },
+                // CANsole monorepo: packages/j2534-bridge/target/...
+                exe_dir
+                    .parent() // target/<triple>/
+                    .and_then(|p| p.parent()) // target/
+                    .and_then(|p| p.parent()) // src-tauri/
+                    .and_then(|p| p.parent()) // apps/cancorder/
+                    .and_then(|p| p.parent()) // apps/
+                    .and_then(|p| p.parent()) // repo root/
+                    .map(|p| {
+                        p.join("packages")
+                            .join("j2534-bridge")
+                            .join("target")
+                            .join(target_triple)
+                            .join(build_type)
+                            .join("j2534-bridge.exe")
+                    }),
                 // Shared crate: ../j2534-bridge/target/...
                 exe_dir
                     .parent()
@@ -240,7 +256,7 @@ impl BridgeClient {
         .map_err(|e| format!("Failed to connect to pipe: {}", e))?;
 
         // Convert to std::fs::File
-        let handle_raw = pipe_handle.0;
+        let handle_raw = pipe_handle.0 as *mut std::ffi::c_void;
         let file = unsafe { std::fs::File::from_raw_handle(handle_raw) };
 
         let reader_file = file

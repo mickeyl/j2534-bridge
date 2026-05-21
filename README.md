@@ -1,12 +1,10 @@
 # j2534-bridge
 
-[![CI](https://github.com/mickeyl/j2534-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/mickeyl/j2534-bridge/actions/workflows/ci.yml)
-[![GitHub release](https://img.shields.io/github/v/tag/mickeyl/j2534-bridge?label=release&sort=semver)](https://github.com/mickeyl/j2534-bridge/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
-[![Platform: Windows](https://img.shields.io/badge/platform-Windows-blue.svg)](https://github.com/mickeyl/j2534-bridge)
-
 Out-of-process J2534 PassThru bridge for cross-bitness DLL loading and fault isolation.
+
+This crate is maintained as `packages/j2534-bridge` inside the CANsole monorepo.
+It supersedes the former nested CANcorder submodule and is shared by CANcorder,
+Studio, and the Python J2534 backend.
 
 ## What it does
 
@@ -53,11 +51,12 @@ The crate provides both a **library** (for host applications) and a **binary** (
 | `j2534.rs` | `J2534Connection` — FFI wrapper for the PassThru API, device enumeration, drain-loop reader. |
 | `main.rs` | Bridge executable entry point: named pipe server, JSON-RPC message loop. |
 
-Host applications depend on the library for `client` and `protocol` modules:
+Host applications depend on the library for `client` and `protocol` modules. In
+CANsole, use a path dependency:
 
 ```toml
 [dependencies]
-j2534-bridge = "0.1.0"
+j2534-bridge = { path = "../../../packages/j2534-bridge" }
 ```
 
 ```rust
@@ -81,22 +80,27 @@ launch the matching 32-bit or 64-bit helper at runtime.
 
 ## Building
 
-The bridge must be compiled for each target architecture. Both executables should be placed alongside the host application:
+The bridge must be compiled for each Windows target architecture. Both
+executables should be staged alongside the host application or into the Tauri
+resource directory:
 
 ```bash
-# Build for both architectures
-rustup target add x86_64-pc-windows-msvc i686-pc-windows-msvc
-cargo build --release --target x86_64-pc-windows-msvc
-cargo build --release --target i686-pc-windows-msvc
-
-# Copy to your app directory
-cp target/x86_64-pc-windows-msvc/release/j2534-bridge.exe /path/to/app/j2534-bridge-64.exe
-cp target/i686-pc-windows-msvc/release/j2534-bridge.exe /path/to/app/j2534-bridge-32.exe
+# From repository root
+make j2534-bridge-dev
 ```
 
 The `BridgeClient` searches for bridge executables in the following order:
 1. Same directory as the host executable (`j2534-bridge-32.exe` / `j2534-bridge-64.exe`)
-2. Development paths relative to `target/` (for `cargo run` workflows)
+2. Tauri resource directory
+3. `apps/cancorder/src-tauri/bin/` staged development resources
+4. Development paths under `packages/j2534-bridge/target/`
+
+The crate is Windows-specific. On macOS/Linux, validate with a Windows target:
+
+```bash
+rustup target add x86_64-pc-windows-msvc
+cargo check --manifest-path packages/j2534-bridge/Cargo.toml --target x86_64-pc-windows-msvc
+```
 
 ## Protocol
 
