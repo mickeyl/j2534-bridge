@@ -38,7 +38,7 @@ endif
 
 DUMP = $(CARGO) run --bin j2534-dump -- $(SELECTOR) $(BITNESS_ARG) --baud-rate $(BAUD) --timeout-ms $(TIMEOUT_MS) --batch-size $(BATCH_SIZE) --max-drain-reads $(MAX_DRAIN_READS) --interface $(INTERFACE)
 
-.PHONY: help test build ensure-bridge ensure-bridge-dev publish-dev list macos-can-usb-list dump dump-std dump-ext dump-both dump-loopback dump-stress-loopback dump-raw dump-isotp native-build native-list native-rx native-rx-hybrid native-rx-v5-6param native-rx-nofilter
+.PHONY: help test smoke build ensure-bridge ensure-bridge-dev publish-dev list macos-can-usb-list dump dump-std dump-ext dump-both dump-loopback dump-stress-loopback dump-raw dump-isotp native-build native-list native-rx native-rx-hybrid native-rx-v5-6param native-rx-nofilter
 
 help:
 	@echo "j2534-bridge test presets"
@@ -52,7 +52,8 @@ help:
 	@echo "  EXTRA='...'              Extra args passed to CLI tools"
 	@echo ""
 	@echo "Targets:"
-	@echo "  make test                  Run fmt, clippy, and library unit tests (refuses on macOS)"
+	@echo "  make test                  Run fmt, clippy, and library unit tests"
+	@echo "  make smoke                 Per-platform smoke test (dispatches on uname -s)"
 	@echo "  make list"
 	@echo "  make macos-can-usb-list    List USB CAN adapters detected on macOS"
 	@echo "  make ensure-bridge-dev     Build and publish fresh dev bridge binaries for CANcorder"
@@ -71,13 +72,41 @@ help:
 	@echo "  make dump-isotp DEVICE='My Adapter'"
 
 test:
-	@if [ "$$(uname -s)" = "Darwin" ]; then \
-		echo "make test is not intended to run on macOS; use Windows or CI instead."; \
-		exit 1; \
-	fi
 	$(CARGO) fmt --all
 	$(CARGO) clippy --lib -- -D warnings
 	$(CARGO) test --lib --verbose
+
+smoke:
+	@uname_s="$$(uname -s)"; \
+	case "$$uname_s" in \
+		Darwin) \
+			echo "==> smoke: macOS"; \
+			$(CARGO) test --lib || exit $$?; \
+			echo "==> macos-can-usb-list (IOKit USB enumeration)"; \
+			$(CARGO) run --quiet --bin macos-can-usb-list || exit $$?; \
+			;; \
+		Linux) \
+			echo "==> smoke: Linux"; \
+			$(CARGO) test --lib || exit $$?; \
+			if rustup target list --installed 2>/dev/null | grep -q '^x86_64-pc-windows-gnu$$'; then \
+				echo "==> cargo check --target x86_64-pc-windows-gnu (cross-compile sanity)"; \
+				$(CARGO) check --target x86_64-pc-windows-gnu || exit $$?; \
+			else \
+				echo "(skipping Windows cross-check: x86_64-pc-windows-gnu target not installed)"; \
+			fi; \
+			;; \
+		MINGW*|MSYS*|CYGWIN*|Windows_NT) \
+			echo "==> smoke: Windows"; \
+			$(CARGO) test --lib || exit $$?; \
+			echo "==> j2534-dump --list (winreg J2534 enumeration)"; \
+			$(CARGO) run --quiet --bin j2534-dump -- --list || exit $$?; \
+			;; \
+		*) \
+			echo "make smoke: unsupported platform '$$uname_s'"; \
+			exit 1; \
+			;; \
+	esac
+	@echo "==> smoke OK"
 
 ensure-bridge:
 	$(CARGO) build $(BUILD_TARGET) --bin j2534-bridge
