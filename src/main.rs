@@ -204,11 +204,16 @@ fn handle_request(
                     can_iso15765: d.can_iso15765,
                     can_iso11898: d.can_iso11898,
                     compatible: d.compatible,
+                    supports_can: d.supports_can,
+                    supports_can_fd: d.supports_can_fd,
+                    supports_kline: d.supports_kline,
                     bitness: d.bitness,
                     available: d.available,
                     unavailable_reason: d.unavailable_reason,
                     api_version: d.api_version,
                     supported_protocols: d.supported_protocols,
+                    baud_rates: d.baud_rates,
+                    init_modes: d.init_modes,
                 })
                 .collect();
             Response::ok(ResponseData::Devices(device_infos))

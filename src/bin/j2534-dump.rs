@@ -1038,11 +1038,16 @@ mod app {
                 can_iso15765: cli.protocol_id == 6,
                 can_iso11898: cli.protocol_id == 5,
                 compatible: true,
+                supports_can: cli.protocol_id == 5 || cli.protocol_id == 6,
+                supports_can_fd: false,
+                supports_kline: cli.protocol_id == 3 || cli.protocol_id == 4,
                 bitness,
                 available: true,
                 unavailable_reason: None,
                 api_version: String::new(),
                 supported_protocols: vec![],
+                baud_rates: Vec::new(),
+                init_modes: Vec::new(),
             });
         }
 

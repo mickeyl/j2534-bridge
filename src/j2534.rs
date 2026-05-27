@@ -427,11 +427,16 @@ pub struct J2534Device {
     pub can_iso15765: bool,
     pub can_iso11898: bool,
     pub compatible: bool,
+    pub supports_can: bool,
+    pub supports_can_fd: bool,
+    pub supports_kline: bool,
     pub bitness: u8,
     pub available: bool,
     pub unavailable_reason: Option<String>,
     pub api_version: String,
     pub supported_protocols: Vec<String>,
+    pub baud_rates: Vec<u32>,
+    pub init_modes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -779,6 +784,14 @@ pub fn enumerate_devices() -> Vec<J2534Device> {
                     {
                         clean_name = format!("{} (v5.0)", clean_name);
                     }
+                    let supports_can = can_iso11898 != 0
+                        || supported_protocols.iter().any(|protocol| protocol == "CAN");
+                    let supports_can_fd = supported_protocols
+                        .iter()
+                        .any(|protocol| protocol == "CAN-FD" || protocol == "ISO-TP FD");
+                    let supports_kline = supported_protocols
+                        .iter()
+                        .any(|protocol| protocol == "ISO 9141" || protocol == "ISO 14230");
 
                     devices.push(J2534Device {
                         name: clean_name,
@@ -787,11 +800,16 @@ pub fn enumerate_devices() -> Vec<J2534Device> {
                         can_iso15765: can_iso15765 != 0,
                         can_iso11898: can_iso11898 != 0,
                         compatible: true,
+                        supports_can,
+                        supports_can_fd,
+                        supports_kline,
                         bitness,
                         available,
                         unavailable_reason,
                         api_version,
                         supported_protocols,
+                        baud_rates: Vec::new(),
+                        init_modes: Vec::new(),
                     });
                 }
             }

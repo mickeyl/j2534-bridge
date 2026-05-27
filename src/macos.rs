@@ -43,12 +43,17 @@ pub struct J2534Device {
     pub can_iso15765: bool,
     pub can_iso11898: bool,
     pub compatible: bool,
+    pub supports_can: bool,
+    pub supports_can_fd: bool,
+    pub supports_kline: bool,
     pub supports_termination: bool,
     pub bitness: u8,
     pub available: bool,
     pub unavailable_reason: Option<String>,
     pub api_version: String,
     pub supported_protocols: Vec<String>,
+    pub baud_rates: Vec<u32>,
+    pub init_modes: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -282,12 +287,17 @@ pub fn enumerate_devices() -> Vec<J2534Device> {
                 can_iso15765: true,
                 can_iso11898: true,
                 compatible,
+                supports_can: true,
+                supports_can_fd: false,
+                supports_kline: false,
                 supports_termination: false,
                 bitness: 0,
                 available: true,
                 unavailable_reason: None,
                 api_version: String::new(),
                 supported_protocols: supported_protocols(true, true),
+                baud_rates: Vec::new(),
+                init_modes: Vec::new(),
             });
         } else if desc.vendor_id() == TOUCAN_VENDOR_ID && desc.product_id() == TOUCAN_PRODUCT_ID {
             seen.insert((bus, addr));
@@ -301,12 +311,17 @@ pub fn enumerate_devices() -> Vec<J2534Device> {
                 can_iso15765: true,
                 can_iso11898: true,
                 compatible,
+                supports_can: true,
+                supports_can_fd: false,
+                supports_kline: false,
                 supports_termination: false,
                 bitness: 0,
                 available: true,
                 unavailable_reason: None,
                 api_version: String::new(),
                 supported_protocols: supported_protocols(true, true),
+                baud_rates: Vec::new(),
+                init_modes: Vec::new(),
             });
         } else if desc.vendor_id() == PEAK_VENDOR_ID
             && (desc.product_id() == PEAK_USB_PRO_FD_PRODUCT_ID
@@ -347,12 +362,17 @@ pub fn enumerate_devices() -> Vec<J2534Device> {
                     can_iso15765: false,
                     can_iso11898: true,
                     compatible: true,
+                    supports_can: true,
+                    supports_can_fd: true,
+                    supports_kline: false,
                     supports_termination: false,
                     bitness: 0,
                     available: true,
                     unavailable_reason: None,
                     api_version: "direct USB".to_string(),
                     supported_protocols: supported_protocols(false, true),
+                    baud_rates: Vec::new(),
+                    init_modes: Vec::new(),
                 });
             }
         } else {
@@ -380,12 +400,17 @@ pub fn enumerate_devices() -> Vec<J2534Device> {
                         can_iso15765: false,
                         can_iso11898: true,
                         compatible,
+                        supports_can: true,
+                        supports_can_fd: true,
+                        supports_kline: false,
                         supports_termination,
                         bitness: 0,
                         available: true,
                         unavailable_reason: None,
                         api_version: String::new(),
                         supported_protocols: supported_protocols(false, true),
+                        baud_rates: Vec::new(),
+                        init_modes: Vec::new(),
                     });
                     break;
                 }

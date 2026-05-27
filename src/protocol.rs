@@ -227,11 +227,21 @@ pub struct DeviceInfo {
     pub can_iso15765: bool,
     pub can_iso11898: bool,
     pub compatible: bool,
+    #[serde(default)]
+    pub supports_can: bool,
+    #[serde(default)]
+    pub supports_can_fd: bool,
+    #[serde(default)]
+    pub supports_kline: bool,
     pub bitness: u8,
     pub available: bool,
     pub unavailable_reason: Option<String>,
     pub api_version: String,
     pub supported_protocols: Vec<String>,
+    #[serde(default)]
+    pub baud_rates: Vec<u32>,
+    #[serde(default)]
+    pub init_modes: Vec<String>,
 }
 
 /// CAN / K-Line message
@@ -655,11 +665,20 @@ mod tests {
             can_iso15765: true,
             can_iso11898: true,
             compatible: true,
+            supports_can: true,
+            supports_can_fd: false,
+            supports_kline: false,
             bitness: 32,
             available: true,
             unavailable_reason: None,
             api_version: "04.04".to_string(),
-            supported_protocols: vec!["CAN".to_string(), "ISO-TP".to_string()],
+            supported_protocols: vec![
+                "CAN".to_string(),
+                "ISO-TP".to_string(),
+                "ISO14230".to_string(),
+            ],
+            baud_rates: vec![10400],
+            init_modes: vec!["none".to_string()],
         };
         let resp = Response::ok(ResponseData::Devices(vec![device]));
         let json = serde_json::to_string(&resp).unwrap();
@@ -675,6 +694,11 @@ mod tests {
                 assert!(devs[0].available);
                 assert!(devs[0].unavailable_reason.is_none());
                 assert_eq!(devs[0].api_version, "04.04");
+                assert!(devs[0].supports_can);
+                assert!(!devs[0].supports_can_fd);
+                assert!(!devs[0].supports_kline);
+                assert_eq!(devs[0].baud_rates, vec![10400]);
+                assert_eq!(devs[0].init_modes, vec!["none"]);
             }
             _ => panic!("Expected Ok with Devices"),
         }
