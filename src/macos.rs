@@ -234,10 +234,13 @@ fn probe_gs_usb_features(vendor_id: u16, product_id: u16) -> Option<u32> {
     Some(bt_const.feature)
 }
 
-fn supported_protocols(can_iso15765: bool, can_iso11898: bool) -> Vec<String> {
+fn supported_protocols(can_iso15765: bool, can_iso11898: bool, can_fd: bool) -> Vec<String> {
     let mut protocols = Vec::new();
     if can_iso11898 {
         protocols.push("CAN".to_string());
+    }
+    if can_fd {
+        protocols.push("CAN-FD".to_string());
     }
     if can_iso15765 {
         protocols.push("ISO-TP".to_string());
@@ -295,7 +298,7 @@ pub fn enumerate_devices() -> Vec<J2534Device> {
                 available: true,
                 unavailable_reason: None,
                 api_version: String::new(),
-                supported_protocols: supported_protocols(true, true),
+                supported_protocols: supported_protocols(true, true, false),
                 baud_rates: Vec::new(),
                 init_modes: Vec::new(),
             });
@@ -319,7 +322,7 @@ pub fn enumerate_devices() -> Vec<J2534Device> {
                 available: true,
                 unavailable_reason: None,
                 api_version: String::new(),
-                supported_protocols: supported_protocols(true, true),
+                supported_protocols: supported_protocols(true, true, false),
                 baud_rates: Vec::new(),
                 init_modes: Vec::new(),
             });
@@ -370,7 +373,7 @@ pub fn enumerate_devices() -> Vec<J2534Device> {
                     available: true,
                     unavailable_reason: None,
                     api_version: "direct USB".to_string(),
-                    supported_protocols: supported_protocols(false, true),
+                    supported_protocols: supported_protocols(false, true, true),
                     baud_rates: Vec::new(),
                     init_modes: Vec::new(),
                 });
@@ -408,7 +411,7 @@ pub fn enumerate_devices() -> Vec<J2534Device> {
                         available: true,
                         unavailable_reason: None,
                         api_version: String::new(),
-                        supported_protocols: supported_protocols(false, true),
+                        supported_protocols: supported_protocols(false, true, true),
                         baud_rates: Vec::new(),
                         init_modes: Vec::new(),
                     });
@@ -419,4 +422,25 @@ pub fn enumerate_devices() -> Vec<J2534Device> {
     }
 
     devices
+}
+
+#[cfg(test)]
+mod tests {
+    use super::supported_protocols;
+
+    #[test]
+    fn supported_protocols_includes_can_fd_when_available() {
+        assert_eq!(
+            supported_protocols(false, true, true),
+            vec!["CAN".to_string(), "CAN-FD".to_string()]
+        );
+    }
+
+    #[test]
+    fn supported_protocols_keeps_iso_tp_for_can_iso15765_adapters() {
+        assert_eq!(
+            supported_protocols(true, true, false),
+            vec!["CAN".to_string(), "ISO-TP".to_string()]
+        );
+    }
 }
