@@ -1056,12 +1056,16 @@ impl J2534Connection {
                 let filter_fn: Symbol<PassThruStartMsgFilterFn> = library
                     .get(b"PassThruStartMsgFilter\0")
                     .map_err(|e| function_not_found("PassThruStartMsgFilter", e))?;
-                let mut mask_msg = PassThruMsg::default();
-                mask_msg.protocol_id = protocol_id;
-                mask_msg.data_size = 1;
-                let mut pattern_msg = PassThruMsg::default();
-                pattern_msg.protocol_id = protocol_id;
-                pattern_msg.data_size = 1;
+                let mask_msg = PassThruMsg {
+                    protocol_id,
+                    data_size: 1,
+                    ..Default::default()
+                };
+                let pattern_msg = PassThruMsg {
+                    protocol_id,
+                    data_size: 1,
+                    ..Default::default()
+                };
                 let mut filter_id: c_ulong = 0;
                 let result = filter_fn(
                     channel_id,
@@ -1316,16 +1320,20 @@ impl J2534Connection {
             let filter_fn: Symbol<PassThruStartMsgFilterFn> = library
                 .get(b"PassThruStartMsgFilter\0")
                 .map_err(|e| function_not_found("PassThruStartMsgFilter", e))?;
-            let mut mask_msg = PassThruMsg::default();
-            mask_msg.protocol_id = protocol_id;
-            mask_msg.tx_flags = tx_flags;
+            let mut mask_msg = PassThruMsg {
+                protocol_id,
+                tx_flags,
+                ..Default::default()
+            };
             let mask_len = mask.len().min(12);
             mask_msg.data[..mask_len].copy_from_slice(&mask[..mask_len]);
             mask_msg.data_size = mask_len as u32;
 
-            let mut pattern_msg = PassThruMsg::default();
-            pattern_msg.protocol_id = protocol_id;
-            pattern_msg.tx_flags = tx_flags;
+            let mut pattern_msg = PassThruMsg {
+                protocol_id,
+                tx_flags,
+                ..Default::default()
+            };
             let pat_len = pattern.len().min(12);
             pattern_msg.data[..pat_len].copy_from_slice(&pattern[..pat_len]);
             pattern_msg.data_size = pat_len as u32;
@@ -1458,8 +1466,10 @@ impl J2534Connection {
                 ));
             }
         } else {
-            let mut msg = PassThruMsg::default();
-            msg.protocol_id = self.protocol_id;
+            let mut msg = PassThruMsg {
+                protocol_id: self.protocol_id,
+                ..Default::default()
+            };
             data_len = if is_can {
                 msg.tx_flags = if extended { CAN_29BIT_ID } else { 0 };
                 msg.data[0] = ((arb_id >> 24) & 0xFF) as u8;
@@ -1570,8 +1580,10 @@ impl J2534Connection {
             let mut msg_buffer: Vec<PassThruMsg> = messages
                 .iter()
                 .map(|(arb_id, data, extended)| {
-                    let mut msg = PassThruMsg::default();
-                    msg.protocol_id = self.protocol_id;
+                    let mut msg = PassThruMsg {
+                        protocol_id: self.protocol_id,
+                        ..Default::default()
+                    };
                     if is_can {
                         msg.tx_flags = if *extended { CAN_29BIT_ID } else { 0 };
                         msg.data[0] = ((arb_id >> 24) & 0xFF) as u8;
@@ -1696,8 +1708,10 @@ impl J2534Connection {
             let mut msg_buffer: Vec<PassThruMsg> = messages
                 .iter()
                 .map(|(arb_id, data, extended)| {
-                    let mut msg = PassThruMsg::default();
-                    msg.protocol_id = self.protocol_id;
+                    let mut msg = PassThruMsg {
+                        protocol_id: self.protocol_id,
+                        ..Default::default()
+                    };
                     if is_can {
                         msg.tx_flags = if *extended { CAN_29BIT_ID } else { 0 };
                         msg.data[0] = ((arb_id >> 24) & 0xFF) as u8;
@@ -1879,9 +1893,7 @@ impl J2534Connection {
                 }
             }
 
-            for i in 0..num_msgs as usize {
-                let msg = &msg_buffer[i];
-
+            for msg in msg_buffer.iter().take(num_msgs as usize) {
                 // Skip TX echo messages (loopback) - these have TX_MSG_TYPE flag set
                 // Unless include_loopback is true (for sanity testing)
                 if !include_loopback && (msg.rx_status & TX_MSG_TYPE) != 0 {
@@ -1953,9 +1965,7 @@ impl J2534Connection {
                 }
             }
 
-            for i in 0..num_msgs as usize {
-                let msg = &msg_buffer[i];
-
+            for msg in msg_buffer.iter().take(num_msgs as usize) {
                 // Skip TX echo messages (loopback) - these have TX_MSG_TYPE flag set
                 // Unless include_loopback is true (for sanity testing)
                 if !include_loopback && (msg.rx_status & TX_MSG_TYPE) != 0 {
@@ -2103,9 +2113,7 @@ impl J2534Connection {
                     break;
                 }
 
-                for i in 0..num_msgs as usize {
-                    let msg = &msg_buffer[i];
-
+                for msg in msg_buffer.iter().take(num_msgs as usize) {
                     // Skip TX echoes by flag
                     if (msg.rx_status & TX_MSG_TYPE) != 0 {
                         continue;
@@ -2175,8 +2183,7 @@ impl J2534Connection {
                         break;
                     }
 
-                    for i in 0..num_msgs as usize {
-                        let msg = &msg_buffer_29[i];
+                    for msg in msg_buffer_29.iter().take(num_msgs as usize) {
                         if (msg.rx_status & TX_MSG_TYPE) != 0 {
                             continue;
                         }
@@ -2248,9 +2255,7 @@ impl J2534Connection {
                     break;
                 }
 
-                for i in 0..num_msgs as usize {
-                    let msg = &msg_buffer[i];
-
+                for msg in msg_buffer.iter().take(num_msgs as usize) {
                     // Skip TX echoes by flag
                     if (msg.rx_status & TX_MSG_TYPE) != 0 {
                         continue;
@@ -2352,8 +2357,7 @@ impl J2534Connection {
                         break;
                     }
 
-                    for i in 0..num_msgs as usize {
-                        let msg = &msg_buffer_29[i];
+                    for msg in msg_buffer_29.iter().take(num_msgs as usize) {
                         if (msg.rx_status & TX_MSG_TYPE) != 0 {
                             continue;
                         }
@@ -2613,9 +2617,11 @@ impl J2534Connection {
                 }
             }
         } else {
-            let mut msg = PassThruMsg::default();
-            msg.protocol_id = self.protocol_id;
-            msg.tx_flags = if extended { CAN_29BIT_ID } else { 0 };
+            let mut msg = PassThruMsg {
+                protocol_id: self.protocol_id,
+                tx_flags: if extended { CAN_29BIT_ID } else { 0 },
+                ..Default::default()
+            };
             msg.data[0] = ((arb_id >> 24) & 0xFF) as u8;
             msg.data[1] = ((arb_id >> 16) & 0xFF) as u8;
             msg.data[2] = ((arb_id >> 8) & 0xFF) as u8;
@@ -2941,9 +2947,11 @@ impl J2534Connection {
                 .to_can_message(is_can)
                 .ok_or_else(|| "ERR_J2534_FAST_INIT_FAILED: empty response".to_string())
         } else {
-            let mut input = PassThruMsg::default();
-            input.protocol_id = self.protocol_id;
-            input.data_size = data.len() as u32;
+            let mut input = PassThruMsg {
+                protocol_id: self.protocol_id,
+                data_size: data.len() as u32,
+                ..Default::default()
+            };
             input.data[..data.len()].copy_from_slice(data);
             let mut output = PassThruMsg::default();
 
