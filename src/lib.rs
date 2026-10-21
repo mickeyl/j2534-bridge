@@ -1,5 +1,6 @@
 pub mod adapter_inventory;
 pub mod protocol;
+pub mod self_test;
 
 #[cfg(windows)]
 pub mod client;

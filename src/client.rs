@@ -20,6 +20,7 @@ pub struct BridgeClient {
     writer: Option<std::fs::File>,
     reader: Option<BufReader<std::fs::File>>,
     next_id: AtomicU64,
+    response_timeout: Option<std::time::Duration>,
 }
 
 impl BridgeClient {
@@ -40,7 +41,14 @@ impl BridgeClient {
             writer: None,
             reader: None,
             next_id: AtomicU64::new(1),
+            response_timeout: None,
         }
+    }
+
+    /// Bound requests for short diagnostics such as a self-test. A timeout
+    /// terminates this client's dedicated worker; late replies are never reused.
+    pub fn set_response_timeout(&mut self, timeout: std::time::Duration) {
+        self.response_timeout = Some(timeout);
     }
 
     /// Get the PID of the bridge process (if running)
@@ -316,9 +324,27 @@ impl BridgeClient {
 
         // Read response
         let mut line = String::new();
-        let bytes_read = reader
-            .read_line(&mut line)
-            .map_err(|e| format!("Failed to read from pipe: {}", e))?;
+        let read = if let Some(timeout) = self.response_timeout {
+            read_line_with_timeout(reader, &mut line, timeout)
+        } else {
+            reader
+                .read_line(&mut line)
+                .map_err(|e| format!("Failed to read from pipe: {}", e))
+        };
+        let bytes_read = match read {
+            Ok(count) => count,
+            Err(error) => {
+                if self.response_timeout.is_some() {
+                    self.reader = None;
+                    self.writer = None;
+                    if let Some(mut child) = self.process.take() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                }
+                return Err(error);
+            }
+        };
 
         if bytes_read == 0 || line.trim().is_empty() {
             let bridge_status = self.check_bridge_status();
@@ -851,6 +877,39 @@ mod tests {
         assert!(!client.is_running());
     }
 
+    #[cfg(windows)]
+    fn test_pipe() -> (std::fs::File, std::fs::File) {
+        use windows::Win32::{Foundation::HANDLE, System::Pipes::CreatePipe};
+        let mut read = HANDLE::default();
+        let mut write = HANDLE::default();
+        unsafe {
+            CreatePipe(&mut read, &mut write, None, 0).unwrap();
+            (
+                std::fs::File::from_raw_handle(read.0),
+                std::fs::File::from_raw_handle(write.0),
+            )
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn response_deadline_handles_buffered_lines_and_stalled_partial_replies() {
+        let (read, mut write) = test_pipe();
+        let mut reader = BufReader::new(read);
+        write.write_all(b"first\nsecond\npartial").unwrap();
+        let mut line = String::new();
+        let timeout = std::time::Duration::from_millis(50);
+        read_line_with_timeout(&mut reader, &mut line, timeout).unwrap();
+        assert_eq!(line, "first\n");
+        read_line_with_timeout(&mut reader, &mut line, timeout).unwrap();
+        assert_eq!(line, "second\n");
+        let start = std::time::Instant::now();
+        assert!(read_line_with_timeout(&mut reader, &mut line, timeout)
+            .unwrap_err()
+            .contains("timed out"));
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn start_returns_clear_error_on_non_windows() {
@@ -861,6 +920,71 @@ mod tests {
             "Bridge client is only supported on Windows"
         );
     }
+}
+
+// Peek before each fill, not just before read_line: a DLL can stop after a
+// partial JSON reply. Buffered bytes must also be consumed before peeking.
+#[cfg(windows)]
+fn read_line_with_timeout(
+    reader: &mut BufReader<std::fs::File>,
+    line: &mut String,
+    timeout: std::time::Duration,
+) -> Result<usize, String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::{Foundation::HANDLE, System::Pipes::PeekNamedPipe};
+    let deadline = std::time::Instant::now() + timeout;
+    let mut bytes = Vec::new();
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err("CAN self-test bridge response timed out".into());
+        }
+        if reader.buffer().is_empty() {
+            let mut available = 0;
+            unsafe {
+                PeekNamedPipe(
+                    HANDLE(reader.get_ref().as_raw_handle()),
+                    None,
+                    0,
+                    None,
+                    Some(&mut available),
+                    None,
+                )
+            }
+            .map_err(|error| format!("Failed to read from pipe: {error}"))?;
+            if available == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                continue;
+            }
+        }
+        let buffer = reader
+            .fill_buf()
+            .map_err(|error| format!("Failed to read from pipe: {error}"))?;
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        let newline = buffer.iter().position(|byte| *byte == b'\n');
+        let count = newline.map_or(buffer.len(), |offset| offset + 1);
+        bytes.extend_from_slice(&buffer[..count]);
+        reader.consume(count);
+        if bytes.len() > 1024 * 1024 {
+            return Err("CAN self-test bridge response is too large".into());
+        }
+        if newline.is_some() {
+            let size = bytes.len();
+            *line = String::from_utf8(bytes)
+                .map_err(|error| format!("Invalid bridge response: {error}"))?;
+            return Ok(size);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn read_line_with_timeout(
+    reader: &mut BufReader<std::fs::File>,
+    line: &mut String,
+    _timeout: std::time::Duration,
+) -> Result<usize, String> {
+    reader.read_line(line).map_err(|error| error.to_string())
 }
 
 impl Drop for BridgeClient {
