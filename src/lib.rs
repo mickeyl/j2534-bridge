@@ -6,6 +6,9 @@ pub mod self_test;
 pub mod client;
 
 #[cfg(windows)]
+pub mod c_api;
+
+#[cfg(windows)]
 pub mod j2534;
 
 #[cfg(target_os = "macos")]

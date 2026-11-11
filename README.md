@@ -104,6 +104,29 @@ cargo check --manifest-path packages/j2534-bridge/Cargo.toml --target x86_64-pc-
 
 ## Protocol
 
+### Native C/C++ hosts
+
+`include/j2534_bridge.h` exposes ABI v1 from the `j2534_bridge.lib` static library
+(`cargo build --release --lib --target x86_64-pc-windows-msvc`). The C++ host
+links this x64 library and stages both helper executables. `j2534_client_start`
+selects the helper's bitness, not the host's. Existing Rust consumers still use
+the same `rlib` and `BridgeClient` APIs.
+
+Create a client with a bounded response timeout, start it, and pass UTF-8 JSON
+Requests to `j2534_client_request`. Responses use the existing protocol's
+`status`/`data`/`message` fields without the internal request-id envelope. Every
+returned string belongs to Rust and must be released with `j2534_string_free`;
+destroying the client stops and reaps the worker. Calls on one client must be
+serialized. No vendor DLL is loaded into the host process. See the header for
+null handling, ownership and pointer lifetime requirements.
+
+`cargo test --lib --target x86_64-pc-windows-msvc` and the corresponding
+`i686-pc-windows-msvc` command cover the ABI validation and packed v05 layout.
+CANsole's C++ tests also exercise the ABI against both real helper processes
+using registry enumeration only, without opening an adapter.
+
+### Wire protocol
+
 Communication uses newline-delimited JSON over a named pipe (`\\.\pipe\j2534-bridge-<pid>`).
 
 Each message has an `id` field for request/response matching:

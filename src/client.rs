@@ -83,6 +83,17 @@ impl BridgeClient {
             return Ok(resource_path);
         }
 
+        // Studio bundles the runtime and both helpers in its binaries resource.
+        for directory in [
+            exe_dir.join("binaries"),
+            exe_dir.join("resources").join("binaries"),
+        ] {
+            let candidate = directory.join(bridge_name);
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+        }
+
         // In development, prefer the explicitly published bridge binaries.
         // This avoids accidentally launching an older cross-target artifact from target/.
         let dev_published_candidates = [

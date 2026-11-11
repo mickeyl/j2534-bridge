@@ -12,6 +12,7 @@ categories = ["api-bindings", "hardware-support", "os::windows-apis"]
 
 [lib]
 name = "j2534_bridge"
+crate-type = ["rlib", "staticlib"]
 
 [[bin]]
 name = "j2534-bridge"

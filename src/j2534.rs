@@ -3174,11 +3174,13 @@ mod v0500_layout_tests {
 
     #[test]
     fn v0500_msg_layout() {
+        let pointer_size = std::mem::size_of::<*mut u8>();
         assert_eq!(
             std::mem::size_of::<PassThruMsgV0500>(),
-            40,
-            "v0500 msg must be 40 bytes (packed)"
+            32 + pointer_size,
+            "v0500 packed message must follow the helper's pointer width"
         );
+        assert_eq!(std::mem::align_of::<PassThruMsgV0500>(), 1);
 
         let mut buf = vec![0u8; 80];
         let msg = PassThruMsgV0500::new(&mut buf);
@@ -3189,7 +3191,10 @@ mod v0500_layout_tests {
             28,
             "data_buffer must be at offset 28 (packed)"
         );
-        assert_eq!(std::ptr::addr_of!(msg.data_buffer_size) as usize - base, 36);
+        assert_eq!(
+            std::ptr::addr_of!(msg.data_buffer_size) as usize - base,
+            28 + pointer_size
+        );
     }
 }
 
