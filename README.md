@@ -6,6 +6,10 @@ This crate is maintained as `packages/j2534-bridge` inside the CANsole monorepo.
 It supersedes the former nested CANcorder submodule and is shared by CANcorder,
 Studio, and the Python J2534 backend.
 
+Raw CAN-FD through SAE J2534 and a built-in native Windows gs_usb backend now
+share the bridge's CAN API. See [the API and bench tools](docs/raw-can-fd.md)
+for supported dialects, access modes, exact frame semantics and hardware tests.
+
 ## What it does
 
 J2534 PassThru is the standard API for automotive diagnostic adapters on Windows. Most adapters ship 32-bit DLLs, but modern applications are 64-bit. A 64-bit process cannot load a 32-bit DLL directly.

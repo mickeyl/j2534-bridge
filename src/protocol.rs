@@ -9,6 +9,21 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params")]
 pub enum Request {
+    EnumerateNativeCanDevices,
+    OpenNativeCan {
+        selector: String,
+        options: crate::can::CanOpenOptions,
+    },
+    /// Explicit raw CAN configuration. FD uses SAE FD_CAN_PS, not GMW17753.
+    OpenCan {
+        dll_path: String,
+        options: crate::can::CanOpenOptions,
+    },
+    /// Validated Classic/FD frames with per-frame BRS. Returns accepted count.
+    SendCanFrames {
+        frames: Vec<crate::can::CanTxFrame>,
+        timeout_ms: u32,
+    },
     /// List available J2534 devices
     EnumerateDevices,
 
@@ -34,7 +49,9 @@ pub enum Request {
     },
 
     /// Send multiple CAN messages in a single PassThruWriteMsgs call
-    SendMessagesBatch { messages: Vec<BatchMessage> },
+    SendMessagesBatch {
+        messages: Vec<BatchMessage>,
+    },
 
     /// Send messages with a custom timeout and return raw result info
     WriteMessagesRaw {
@@ -54,10 +71,15 @@ pub enum Request {
     },
 
     /// Read messages including loopback echoes (for sanity testing)
-    ReadMessagesWithLoopback { timeout_ms: u32 },
+    ReadMessagesWithLoopback {
+        timeout_ms: u32,
+    },
 
     /// Read messages and return raw J2534 result code + count (for spec testing)
-    ReadMessagesRaw { timeout_ms: u32, max_msgs: u32 },
+    ReadMessagesRaw {
+        timeout_ms: u32,
+        max_msgs: u32,
+    },
 
     /// Clear TX and RX buffers
     ClearBuffers,
@@ -75,10 +97,14 @@ pub enum Request {
     ReadProgrammingVoltage,
 
     /// Perform ISO/K-Line fast init and return the reply message
-    FastInit { data: Vec<u8> },
+    FastInit {
+        data: Vec<u8>,
+    },
 
     /// Perform ISO/K-Line five-baud init and return the reply message
-    FiveBaudInit { data: Vec<u8> },
+    FiveBaudInit {
+        data: Vec<u8>,
+    },
 
     /// Full K-Line autodetection and initialization (fast/slow/auto) with
     /// CC acknowledgment polling — runs entirely inside the bridge process
@@ -102,7 +128,9 @@ pub enum Request {
     },
 
     /// Stop a periodic message
-    StopPeriodicMessage { msg_id: u32 },
+    StopPeriodicMessage {
+        msg_id: u32,
+    },
 
     /// Clear all periodic messages
     ClearPeriodicMessages,
@@ -124,22 +152,31 @@ pub enum Request {
     },
 
     /// Remove a message filter
-    RemoveFilter { filter_id: u32 },
+    RemoveFilter {
+        filter_id: u32,
+    },
 
     /// Clear all filters
     ClearFilters,
 
     /// Get a configuration parameter
-    GetConfig { parameter: u32 },
+    GetConfig {
+        parameter: u32,
+    },
 
     /// Set a configuration parameter
-    SetConfig { parameter: u32, value: u32 },
+    SetConfig {
+        parameter: u32,
+        value: u32,
+    },
 
     /// Get loopback setting
     GetLoopback,
 
     /// Set loopback setting
-    SetLoopback { enabled: bool },
+    SetLoopback {
+        enabled: bool,
+    },
 
     /// Get current data rate
     GetDataRate,
@@ -196,6 +233,9 @@ pub struct KlineInitResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ResponseData {
+    NativeDevices {
+        native_devices: Vec<NativeCanDeviceInfo>,
+    },
     None,
     Devices(Vec<DeviceInfo>),
     Connected,
@@ -207,6 +247,14 @@ pub enum ResponseData {
     Number(u32),
     Float(f64),
     Bool(bool),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeCanDeviceInfo {
+    pub selector: String,
+    pub name: String,
+    pub serial: String,
+    pub backend: String,
 }
 
 /// Raw J2534 result payload
@@ -258,6 +306,18 @@ pub struct CanMessage {
     /// J2534 protocol ID (5=CAN, 3=ISO9141, 4=ISO14230, etc.)
     #[serde(default = "default_protocol_can")]
     pub protocol_id: u32,
+}
+
+impl CanMessage {
+    pub fn is_fd(&self) -> bool {
+        self.protocol_id == crate::can::FD_CAN_PS && self.rx_status & crate::can::FD_CAN_FORMAT != 0
+    }
+    pub fn bitrate_switch(&self) -> bool {
+        self.is_fd() && self.rx_status & crate::can::FD_CAN_BRS != 0
+    }
+    pub fn error_state_indicator(&self) -> bool {
+        self.is_fd() && self.rx_status & crate::can::FD_CAN_ESI != 0
+    }
 }
 
 fn default_protocol_can() -> u32 {
@@ -312,6 +372,53 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fd_and_native_requests_round_trip_without_changing_legacy_open() {
+        for method in ["OpenCan", "OpenNativeCan"] {
+            let json = format!(
+                r#"{{"method":"{method}","params":{{"dll_path":"driver.dll","selector":"gs_usb:1d50:606f:abc","options":{{"nominal_bitrate":500000,"data_bitrate":2000000}}}}}}"#
+            );
+            let request: Request = serde_json::from_str(&json).unwrap();
+            let encoded = serde_json::to_string(&request).unwrap();
+            let decoded: Request = serde_json::from_str(&encoded).unwrap();
+            assert!(matches!(
+                decoded,
+                Request::OpenCan { .. } | Request::OpenNativeCan { .. }
+            ));
+        }
+        let request = Request::SendCanFrames {
+            frames: vec![crate::can::CanTxFrame {
+                arb_id: 0x123,
+                extended: true,
+                data: (0..64).collect(),
+                is_fd: true,
+                bitrate_switch: true,
+            }],
+            timeout_ms: 1000,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        let decoded: Request = serde_json::from_str(&json).unwrap();
+        match decoded {
+            Request::SendCanFrames { frames, .. } => assert_eq!(frames[0].data.len(), 64),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn empty_native_inventory_is_unambiguous() {
+        let json = serde_json::to_string(&Response::ok(ResponseData::NativeDevices {
+            native_devices: vec![],
+        }))
+        .unwrap();
+        let decoded: Response = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            Response::Ok {
+                data: ResponseData::NativeDevices { .. }
+            }
+        ));
+    }
 
     fn make_test_message() -> CanMessage {
         CanMessage {

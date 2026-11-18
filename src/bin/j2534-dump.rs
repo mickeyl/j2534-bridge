@@ -7,6 +7,7 @@ fn main() {
 #[cfg(windows)]
 mod app {
     use clap::{Parser, ValueEnum};
+    use j2534_bridge::can::{CanOpenOptions, CanTxFrame};
     use j2534_bridge::client::BridgeClient;
     use j2534_bridge::protocol::{
         CanMessage, DeviceInfo, KlineInitMode as ProtoKlineInitMode, RawIoResult,
@@ -65,11 +66,38 @@ mod app {
     }
 
     #[derive(Parser, Debug)]
-    #[command(name = "j2534-dump")]
+    #[command(name = "j2534-dump", version)]
     #[command(
         about = "Exercise J2534 bridge open/filter/config parameters and dump traffic in a candump-style text format"
     )]
     struct Cli {
+        #[arg(long, conflicts_with_all = ["dll_path", "device_name", "open_name"], help = "Native CAN selector from --list-native, e.g. gs_usb:1d50:606f:SERIAL")]
+        native: Option<String>,
+        #[arg(
+            long,
+            help = "List native USB CAN devices without starting a CAN controller"
+        )]
+        list_native: bool,
+        #[arg(
+            long,
+            help = "Enable SAE J2534 raw CAN FD (requires --data-baud-rate)",
+            requires = "data_baud_rate"
+        )]
+        can_fd: bool,
+        #[arg(long, requires = "can_fd")]
+        data_baud_rate: Option<u32>,
+        #[arg(long, help = "Vendor PassThruOpen name, e.g. J2534-2:PEAK 0x51")]
+        open_name: Option<String>,
+        #[arg(
+            long,
+            help = "Require electrically silent reception (currently unsupported by this bridge)"
+        )]
+        listen_only: bool,
+        #[arg(
+            long,
+            help = "Send once: ID#HEX (Classic) or ID##0HEX / ID##1HEX (FD / FD+BRS); 8-digit IDs are extended"
+        )]
+        send: Vec<String>,
         #[arg(
             long,
             help = "List devices visible through the selected bridge bitness and exit"
@@ -282,6 +310,7 @@ mod app {
         let initial_bitness = resolve_initial_bitness(&cli)?;
 
         let mut bridge = BridgeClient::new();
+        bridge.set_response_timeout(Duration::from_secs(10));
         bridge.start(initial_bitness)?;
 
         if cli.list {
@@ -290,8 +319,25 @@ mod app {
             return Ok(());
         }
 
-        let selected = select_device(&mut bridge, &cli)?;
-        let bitness = cli.bitness.unwrap_or(selected.bitness);
+        if cli.list_native {
+            for device in bridge.enumerate_native_can_devices()? {
+                println!(
+                    "{} | {} | backend={}",
+                    device.selector, device.name, device.backend
+                );
+            }
+            return Ok(());
+        }
+
+        let selected = if cli.native.is_some() {
+            None
+        } else {
+            Some(select_device(&mut bridge, &cli)?)
+        };
+        let dll_path = selected.as_ref().map(|d| d.dll_path.as_str()).unwrap_or("");
+        let bitness = cli
+            .bitness
+            .unwrap_or(selected.as_ref().map(|d| d.bitness).unwrap_or(64));
         if bitness != initial_bitness {
             bridge.stop()?;
             bridge.start(bitness)?;
@@ -305,14 +351,61 @@ mod app {
 
         eprintln!(
             "[j2534-dump] opening dll={} bitness={} protocol={} baud={} flags=0x{:X}",
-            selected.dll_path, bitness, cli.protocol_id, cli.baud_rate, connect_flags
+            dll_path, bitness, cli.protocol_id, cli.baud_rate, connect_flags
         );
-        bridge.open(
-            &selected.dll_path,
-            cli.protocol_id,
-            cli.baud_rate,
-            connect_flags,
-        )?;
+        let transmit_frames = cli
+            .send
+            .iter()
+            .map(|s| parse_can_frame(s))
+            .collect::<Result<Vec<_>, _>>()?;
+        for frame in &transmit_frames {
+            frame.encode(cli.can_fd)?;
+        }
+        if cli.listen_only && !transmit_frames.is_empty() {
+            return Err("Cannot send with --listen-only".into());
+        }
+        if let Some(selector) = &cli.native {
+            if cli.protocol_id != 5
+                || cli.connect_flags.is_some()
+                || cli.connect_mode != ConnectMode::Both
+            {
+                return Err(
+                    "Native CAN uses raw mixed-ID capture; omit protocol/connect overrides".into(),
+                );
+            }
+            bridge.open_native_can(
+                selector,
+                CanOpenOptions {
+                    nominal_bitrate: cli.baud_rate,
+                    data_bitrate: cli.data_baud_rate,
+                    device_name: None,
+                    listen_only: cli.listen_only,
+                },
+            )?;
+            eprintln!(
+                "[j2534-dump] native CAN: {selector}; listen_only={}",
+                cli.listen_only
+            );
+        } else if cli.can_fd || cli.open_name.is_some() || cli.listen_only {
+            if cli.protocol_id != 5
+                || cli.connect_flags.is_some()
+                || cli.connect_mode != ConnectMode::Both
+            {
+                return Err("--can-fd/--open-name use raw CAN with mixed 11/29-bit capture; omit protocol/connect overrides".into());
+            }
+            bridge.open_can(
+                dll_path,
+                CanOpenOptions {
+                    nominal_bitrate: cli.baud_rate,
+                    data_bitrate: cli.data_baud_rate,
+                    device_name: cli.open_name.clone(),
+                    listen_only: cli.listen_only,
+                },
+            )?;
+            eprintln!("[j2534-dump] raw CAN open: nominal={} data={:?} name={:?}; controller active (ACK enabled)", cli.baud_rate, cli.data_baud_rate, cli.open_name);
+        } else {
+            bridge.open(dll_path, cli.protocol_id, cli.baud_rate, connect_flags)?;
+        }
 
         if cli.clear_buffers {
             bridge.clear_buffers()?;
@@ -369,7 +462,11 @@ mod app {
         }
 
         if cli.show_state {
-            let loopback = bridge.get_loopback()?;
+            let loopback = if cli.native.is_some() {
+                "not supported".to_string()
+            } else {
+                bridge.get_loopback()?.to_string()
+            };
             let data_rate = bridge.get_data_rate()?;
             eprintln!(
                 "[j2534-dump] state loopback={} data_rate={}",
@@ -378,7 +475,40 @@ mod app {
         }
 
         run_post_init_kline_request(&mut bridge, &cli)?;
+        for frame in transmit_frames {
+            let count = bridge.send_can_frames(vec![frame], 1000)?;
+            if count != 1 {
+                return Err(format!("Driver accepted {count}/1 frames"));
+            }
+        }
         capture_loop(&mut bridge, &cli)
+    }
+
+    fn parse_can_frame(text: &str) -> Result<CanTxFrame, String> {
+        let (id, rest) = text
+            .split_once('#')
+            .ok_or("Expected ID#HEX or ID##FLAGSHEX")?;
+        let (is_fd, bitrate_switch, payload) = if let Some(fd) = rest.strip_prefix('#') {
+            match fd.as_bytes().first() {
+                Some(b'0') => (true, false, &fd[1..]),
+                Some(b'1') => (true, true, &fd[1..]),
+                _ => {
+                    return Err(
+                        "FD transmit flags must be 0 or 1 (BRS); ESI is controller-owned".into(),
+                    )
+                }
+            }
+        } else {
+            (false, false, rest)
+        };
+        let arb_id = u32::from_str_radix(id, 16).map_err(|e| e.to_string())?;
+        Ok(CanTxFrame {
+            arb_id,
+            data: parse_hex_bytes(payload)?,
+            extended: id.len() == 8 || arb_id > 0x7ff,
+            is_fd,
+            bitrate_switch,
+        })
     }
 
     fn install_ctrlc_flag() -> Result<Arc<AtomicBool>, String> {
@@ -936,6 +1066,7 @@ mod app {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn format_candump_line(
         msg: &CanMessage,
         interface: &str,
@@ -963,7 +1094,15 @@ mod app {
             format!("{:03X}", msg.arb_id & 0x7FF)
         };
         let data = format_bytes_compact(&msg.data);
-        let mut line = format!("{prefix}{interface} {id}#{data}");
+        let marker = if msg.is_fd() {
+            format!(
+                "##{:X}",
+                u8::from(msg.bitrate_switch()) | (u8::from(msg.error_state_indicator()) << 1)
+            )
+        } else {
+            "#".into()
+        };
+        let mut line = format!("{prefix}{interface} {id}{marker}{data}");
         if ascii {
             line.push_str("  ");
             line.push('\'');
@@ -1165,7 +1304,7 @@ mod app {
             .chars()
             .filter(|c| !matches!(c, ' ' | '_' | ':' | ',' | '-'))
             .collect();
-        if cleaned.len() % 2 != 0 {
+        if !cleaned.is_ascii() || cleaned.len() % 2 != 0 {
             return Err(format!("Hex byte string must have even length: '{input}'"));
         }
         let mut bytes = Vec::with_capacity(cleaned.len() / 2);
@@ -1240,6 +1379,41 @@ mod app {
             0x014c => Ok(32),
             0x8664 | 0xAA64 => Ok(64),
             _ => Err(format!("unsupported PE machine 0x{machine:04X}")),
+        }
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn fd_candump_parser_and_formatter_preserve_wire_flags() {
+            let frame = parse_can_frame("00000123##1".to_owned().as_str()).unwrap();
+            assert!(frame.extended && frame.is_fd && frame.bitrate_switch);
+            let msg = CanMessage {
+                timestamp_us: 0,
+                arb_id: frame.arb_id,
+                extended: frame.extended,
+                data: vec![0xa5; 64],
+                raw_arb_id: frame.arb_id,
+                rx_status: 0x380100,
+                data_size: 68,
+                protocol_id: j2534_bridge::can::FD_CAN_PS,
+            };
+            let line = format_candump_line(
+                &msg,
+                "can0",
+                TimestampMode::None,
+                false,
+                Instant::now(),
+                0,
+                1,
+                false,
+            );
+            assert!(line.starts_with("can0 00000123##3"));
+            assert_eq!(line.matches("A5").count(), 64);
+            assert!(parse_can_frame("123##2AA").is_err());
+            assert!(parse_can_frame("123#??").is_err());
+            let invalid = parse_can_frame("123##1AABBCCDDEEFF001122").unwrap();
+            assert!(invalid.encode(true).is_err());
         }
     }
 }

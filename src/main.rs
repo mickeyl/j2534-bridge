@@ -9,8 +9,7 @@
 //! Environment variables:
 //!   J2534_BRIDGE_VERBOSE=1  - Enable verbose logging of all requests
 
-mod j2534;
-mod protocol;
+use j2534_bridge::{can, j2534, protocol};
 mod worker;
 
 use protocol::{DeviceInfo, Message, Request, Response, ResponseData};
@@ -89,7 +88,7 @@ fn run_bridge(pipe_name: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("[bridge] Client connected");
 
-    let handle_raw = pipe_handle.0 as *mut std::ffi::c_void;
+    let handle_raw = pipe_handle.0;
     let file = unsafe { std::fs::File::from_raw_handle(handle_raw) };
 
     message_loop(file)
@@ -193,6 +192,38 @@ fn handle_request(
     connection: &Arc<Mutex<Option<worker::BridgeWorker>>>,
 ) -> Response {
     match request {
+        Request::EnumerateNativeCanDevices => match j2534_bridge::gs_usb::enumerate() {
+            Ok(devices) => Response::ok(ResponseData::NativeDevices {
+                native_devices: devices,
+            }),
+            Err(error) => Response::error(-1, error),
+        },
+        Request::OpenNativeCan { selector, options } => {
+            let mut guard = connection.lock().unwrap();
+            if guard.is_some() {
+                return Response::error(-1, "Already connected");
+            }
+            match worker::BridgeWorker::spawn_native(selector.clone(), options.clone()) {
+                Ok(worker) => {
+                    *guard = Some(worker);
+                    Response::ok_none()
+                }
+                Err(error) => Response::error(-1, error),
+            }
+        }
+        Request::OpenCan { dll_path, options } => {
+            let mut worker_guard = connection.lock().unwrap();
+            if worker_guard.is_some() {
+                return Response::error(-1, "Already connected");
+            }
+            match worker::BridgeWorker::spawn_can(dll_path.clone(), options.clone()) {
+                Ok(worker) => {
+                    *worker_guard = Some(worker);
+                    Response::ok_none()
+                }
+                Err(err) => Response::error(-1, err),
+            }
+        }
         Request::EnumerateDevices => {
             let devices = j2534::enumerate_devices();
             let device_infos: Vec<DeviceInfo> = devices

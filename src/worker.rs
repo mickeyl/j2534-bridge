@@ -63,11 +63,67 @@ impl WorkerConfig {
 }
 
 impl BridgeWorker {
+    pub fn spawn_native(
+        selector: String,
+        options: crate::can::CanOpenOptions,
+    ) -> Result<Self, String> {
+        options.validate_rates()?;
+        let (tx, rx) = mpsc::channel();
+        let (startup_tx, startup_rx) = mpsc::sync_channel(1);
+        let join = thread::Builder::new()
+            .name("bridge-gs-usb".into())
+            .spawn(move || {
+                native_worker_loop(rx, startup_tx, selector, options);
+            })
+            .map_err(|e| e.to_string())?;
+        match startup_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                tx,
+                join: Some(join),
+            }),
+            Ok(Err(error)) => {
+                let _ = join.join();
+                Err(error)
+            }
+            Err(error) => {
+                let _ = join.join();
+                Err(error.to_string())
+            }
+        }
+    }
+    pub fn spawn_can(
+        dll_path: String,
+        options: crate::can::CanOpenOptions,
+    ) -> Result<Self, String> {
+        options.validate()?;
+        Self::spawn_inner(
+            dll_path,
+            if options.data_bitrate.is_some() {
+                crate::can::FD_CAN_PS
+            } else {
+                5
+            },
+            options.nominal_bitrate,
+            0x900,
+            Some(options),
+        )
+    }
+
     pub fn spawn(
         dll_path: String,
         protocol_id: u32,
         baud_rate: u32,
         connect_flags: u32,
+    ) -> Result<Self, String> {
+        Self::spawn_inner(dll_path, protocol_id, baud_rate, connect_flags, None)
+    }
+
+    fn spawn_inner(
+        dll_path: String,
+        protocol_id: u32,
+        baud_rate: u32,
+        connect_flags: u32,
+        options: Option<crate::can::CanOpenOptions>,
     ) -> Result<Self, String> {
         let (tx, rx) = mpsc::channel();
         let (startup_tx, startup_rx) = mpsc::sync_channel(1);
@@ -82,6 +138,7 @@ impl BridgeWorker {
                     protocol_id,
                     baud_rate,
                     connect_flags,
+                    options,
                 );
             })
             .map_err(|e| format!("Failed to start bridge worker: {}", e))?;
@@ -122,6 +179,92 @@ impl BridgeWorker {
     }
 }
 
+fn native_worker_loop(
+    rx: Receiver<WorkerCommand>,
+    startup: SyncSender<Result<(), String>>,
+    selector: String,
+    options: crate::can::CanOpenOptions,
+) {
+    let mut device = match j2534_bridge::gs_usb::GsUsb::open(&selector, &options) {
+        Ok(device) => {
+            let _ = startup.send(Ok(()));
+            device
+        }
+        Err(error) => {
+            let _ = startup.send(Err(error));
+            return;
+        }
+    };
+    let mut queue = VecDeque::new();
+    let mut stats = RxBufferStats::default();
+    let mut receive_error: Option<String> = None;
+    loop {
+        match device.receive(Duration::ZERO) {
+            Ok(frames) => push_messages(&mut queue, &mut stats, DEFAULT_RX_CAPACITY, frames),
+            Err(error) => {
+                receive_error = Some(error);
+            }
+        }
+        if stats.dropped_frames > 0 {
+            receive_error = Some(format!(
+                "Native CAN RX overflow: {} frames dropped",
+                stats.dropped_frames
+            ));
+        }
+        let (request, response_tx) = match rx.recv_timeout(Duration::from_millis(1)) {
+            Ok(WorkerCommand::Request {
+                request,
+                response_tx,
+            }) => (request, response_tx),
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        if matches!(request, Request::Close | Request::Shutdown) {
+            let result = device.close();
+            send_response(
+                &response_tx,
+                match result {
+                    Ok(()) => Response::ok_none(),
+                    Err(error) => Response::error(-1, error),
+                },
+            );
+            break;
+        }
+        let response = match request {
+            Request::ReadMessages { timeout_ms, batch_size, max_drain_reads } => {
+                let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms.min(60_000)));
+                while queue.is_empty() && receive_error.is_none() && Instant::now() < deadline {
+                    match device.receive(Duration::ZERO) {
+                        Ok(frames) => push_messages(&mut queue, &mut stats, DEFAULT_RX_CAPACITY, frames),
+                        Err(error) => receive_error = Some(error),
+                    }
+                }
+                match &receive_error {
+                    Some(error) => Response::error(-1, error.clone()),
+                    None => Response::ok(ResponseData::Messages(drain_buffer(&mut queue, compute_read_limit(batch_size, max_drain_reads)))),
+                }
+            }
+            Request::SendCanFrames { frames, timeout_ms } => {
+                let result = (|| {
+                    if let Some(error) = &receive_error { return Err(format!("Native CAN receive fault: {error}")); }
+                    if frames.len() > 10 || timeout_ms > 60_000 { return Err("Native CAN batches are limited to 10 frames".into()); }
+                    for frame in &frames { frame.encode(options.data_bitrate.is_some())?; }
+                    for (index, frame) in frames.iter().enumerate() {
+                        device.send(frame).map_err(|e| format!("{e}; accepted={index}/{}", frames.len()))?;
+                    }
+                    Ok(frames.len() as u32)
+                })();
+                match result { Ok(count) => Response::ok(ResponseData::Number(count)), Err(error) => Response::error(-1, error) }
+            }
+            Request::GetConfig { parameter: j2534::DATA_RATE } | Request::GetDataRate => Response::ok(ResponseData::Number(options.nominal_bitrate)),
+            Request::GetConfig { parameter: crate::can::FD_CAN_DATA_PHASE_RATE } => Response::ok(ResponseData::Number(options.data_bitrate.unwrap_or(options.nominal_bitrate))),
+            Request::ReadVersion => Response::ok(ResponseData::Version(VersionInfo { api_version: "native gs_usb".into(), dll_version: env!("CARGO_PKG_VERSION").into(), firmware_version: "not queried".into() })),
+            _ => Response::error(-1, "Operation unsupported by native gs_usb; use OpenNativeCan, SendCanFrames and ReadMessages"),
+        };
+        send_response(&response_tx, response);
+    }
+}
+
 fn worker_loop(
     rx: Receiver<WorkerCommand>,
     startup_tx: SyncSender<Result<(), String>>,
@@ -129,11 +272,18 @@ fn worker_loop(
     protocol_id: u32,
     baud_rate: u32,
     connect_flags: u32,
+    options: Option<crate::can::CanOpenOptions>,
 ) {
     let config = WorkerConfig::from_env();
 
-    let conn = match J2534Connection::open(&dll_path, protocol_id, baud_rate, connect_flags, |_| {})
-    {
+    let conn = match J2534Connection::open_with_options(
+        &dll_path,
+        protocol_id,
+        baud_rate,
+        connect_flags,
+        options.as_ref(),
+        |_| {},
+    ) {
         Ok(conn) => {
             let _ = startup_tx.send(Ok(()));
             conn
@@ -189,7 +339,11 @@ fn handle_worker_request(
     config: &WorkerConfig,
 ) -> bool {
     match request {
-        Request::EnumerateDevices | Request::Open { .. } => {
+        Request::EnumerateNativeCanDevices
+        | Request::OpenNativeCan { .. }
+        | Request::EnumerateDevices
+        | Request::Open { .. }
+        | Request::OpenCan { .. } => {
             send_response(
                 response_tx,
                 Response::error(-1, "Request must be handled by the bridge control thread"),
@@ -258,6 +412,12 @@ fn handle_worker_request(
 
 fn execute_direct_request(conn: &J2534Connection, request: Request) -> Response {
     match request {
+        Request::SendCanFrames { frames, timeout_ms } => {
+            match conn.send_can_frames(&frames, timeout_ms) {
+                Ok(count) => Response::ok(ResponseData::Number(count)),
+                Err(err) => Response::error(-1, err),
+            }
+        }
         Request::SendMessage {
             arb_id,
             data,
@@ -431,8 +591,11 @@ fn execute_direct_request(conn: &J2534Connection, request: Request) -> Response 
         | Request::ClearBuffers
         | Request::Close
         | Request::Shutdown
+        | Request::EnumerateNativeCanDevices
+        | Request::OpenNativeCan { .. }
         | Request::EnumerateDevices
-        | Request::Open { .. } => Response::error(-1, "Unsupported worker request dispatch"),
+        | Request::Open { .. }
+        | Request::OpenCan { .. } => Response::error(-1, "Unsupported worker request dispatch"),
     }
 }
 
@@ -839,8 +1002,11 @@ mod tests {
 
     // --- WorkerConfig defaults ---
 
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn worker_config_defaults() {
+        let _lock = ENV_LOCK.lock().unwrap();
         // Clear any env vars that might interfere
         std::env::remove_var("J2534_BRIDGE_RX_CAPACITY");
         std::env::remove_var("J2534_BRIDGE_POLL_INTERVAL_MS");
@@ -859,6 +1025,7 @@ mod tests {
 
     #[test]
     fn worker_config_clamping() {
+        let _lock = ENV_LOCK.lock().unwrap();
         std::env::set_var("J2534_BRIDGE_RX_CAPACITY", "0");
         std::env::set_var("J2534_BRIDGE_POLL_INTERVAL_MS", "0");
         std::env::set_var("J2534_BRIDGE_PUMP_BATCH_SIZE", "9999");

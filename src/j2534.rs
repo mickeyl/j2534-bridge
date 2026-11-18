@@ -1,3 +1,4 @@
+use crate::can::{CanOpenOptions, CanTxFrame, FD_CAN_DATA_PHASE_RATE, FD_CAN_PS, J1962_PINS};
 use libloading::{Library, Symbol};
 use serde::{Deserialize, Serialize};
 use std::ffi::{c_char, c_ulong, c_void};
@@ -5,6 +6,10 @@ use std::fmt;
 use std::sync::Mutex;
 use winreg::enums::*;
 use winreg::RegKey;
+
+fn is_can_protocol(protocol: u32) -> bool {
+    matches!(protocol, PROTOCOL_CAN | PROTOCOL_ISO15765 | FD_CAN_PS)
+}
 
 // J2534 Protocol IDs
 // Note: Only CAN protocol is supported. Other protocols (ISO15765, ISO9141, etc.)
@@ -76,6 +81,8 @@ pub const READ_PROG_VOLTAGE: u32 = 0x0E;
 // J2534 Config Parameter IDs
 pub const DATA_RATE: u32 = 0x01;
 pub const LOOPBACK: u32 = 0x03;
+// SAE J2534-1_0500 physical-channel TX echo configuration.
+pub const ECHO_PHYSICAL_CHANNEL_TX: u32 = 0x31;
 #[allow(dead_code)]
 pub const NODE_ADDRESS: u32 = 0x04;
 #[allow(dead_code)]
@@ -309,6 +316,7 @@ pub fn protocol_id_to_string(id: u32) -> &'static str {
         PROTOCOL_ISO9141 => "ISO9141",
         PROTOCOL_ISO14230 => "ISO14230",
         PROTOCOL_CAN => "CAN",
+        FD_CAN_PS => "FD_CAN_PS",
         PROTOCOL_ISO15765 => "ISO15765",
         PROTOCOL_SCI_A_ENGINE => "SCI_A_ENGINE",
         PROTOCOL_SCI_A_TRANS => "SCI_A_TRANS",
@@ -368,9 +376,6 @@ impl PassThruMsgV0500 {
     /// Create a zeroed v05.00 message backed by the given buffer slice.
     /// Uses MaybeUninit + zeroed to guarantee padding bytes are zero.
     fn new(buf: &mut [u8]) -> Self {
-        for b in buf.iter_mut() {
-            *b = 0;
-        }
         let mut msg: Self = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
         msg.data_buffer = buf.as_mut_ptr();
         msg.data_buffer_size = buf.len() as u32;
@@ -379,6 +384,9 @@ impl PassThruMsgV0500 {
 
     /// Convert to the common CANMessage representation (same logic as v04.04 path).
     fn to_can_message(&self, is_can: bool) -> Option<CANMessage> {
+        if self.data_length > self.data_buffer_size {
+            return None;
+        }
         if is_can {
             if self.data_length < 4 || self.data_buffer.is_null() {
                 return None;
@@ -490,10 +498,10 @@ pub struct RawIoResult {
 }
 
 fn passthru_msg_to_can_message(msg: &PassThruMsg) -> CANMessage {
-    let is_can = msg.protocol_id == PROTOCOL_CAN || msg.protocol_id == PROTOCOL_ISO15765;
+    let is_can = is_can_protocol(msg.protocol_id);
     if is_can && msg.data_size >= 4 {
         let arb_id = u32::from_be_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
-        let data_len = (msg.data_size - 4) as usize;
+        let data_len = ((msg.data_size - 4) as usize).min(msg.data.len() - 4);
         let data = msg.data[4..4 + data_len].to_vec();
         CANMessage {
             timestamp_us: msg.timestamp as u64,
@@ -508,7 +516,7 @@ fn passthru_msg_to_can_message(msg: &PassThruMsg) -> CANMessage {
             protocol_id: msg.protocol_id,
         }
     } else {
-        let data = msg.data[..msg.data_size as usize].to_vec();
+        let data = msg.data[..(msg.data_size as usize).min(msg.data.len())].to_vec();
         CANMessage {
             timestamp_us: msg.timestamp as u64,
             arb_id: 0,
@@ -536,6 +544,12 @@ pub struct SConfig {
 pub struct SConfigList {
     pub num_of_params: u32,
     pub config_ptr: *mut SConfig,
+}
+
+#[repr(C, packed)]
+struct SConfigListV0500 {
+    num_of_params: u32,
+    config_ptr: *mut SConfig,
 }
 
 /// SBYTE_ARRAY structure used by certain IOCTLs such as FIVE_BAUD_INIT.
@@ -732,7 +746,8 @@ pub fn enumerate_devices() -> Vec<J2534Device> {
                         ("ISO14230", "ISO 14230"),
                         ("J1850PWM", "J1850 PWM"),
                         ("J1850VPW", "J1850 VPW"),
-                        ("CAN_FD_PS", "CAN-FD"),
+                        ("CAN_FD_PS", "CAN-FD (GMW)"),
+                        ("FD_CAN_PS", "CAN-FD"),
                         ("ISO15765_FD_PS", "ISO-TP FD"),
                         ("SW_CAN_PS", "SW-CAN"),
                         ("TP2_0_PS", "TP 2.0"),
@@ -776,7 +791,16 @@ pub fn enumerate_devices() -> Vec<J2534Device> {
                                 32
                             },
                         ),
-                        Some(bits) => (true, None, detect_api_version(&dll_path), bits),
+                        Some(bits) => (
+                            true,
+                            None,
+                            if is_v5_registry {
+                                "05.00".into()
+                            } else {
+                                detect_api_version(&dll_path)
+                            },
+                            bits,
+                        ),
                     };
                     let mut clean_name = clean_device_name(&name);
                     // Disambiguate v5.0 entries from their v4.04 counterparts
@@ -786,9 +810,11 @@ pub fn enumerate_devices() -> Vec<J2534Device> {
                     }
                     let supports_can = can_iso11898 != 0
                         || supported_protocols.iter().any(|protocol| protocol == "CAN");
-                    let supports_can_fd = supported_protocols
-                        .iter()
-                        .any(|protocol| protocol == "CAN-FD" || protocol == "ISO-TP FD");
+                    let supports_can_fd = crate::can::supports_raw_can_fd(
+                        &vendor,
+                        &supported_protocols,
+                        &api_version,
+                    );
                     let supports_kline = supported_protocols
                         .iter()
                         .any(|protocol| protocol == "ISO 9141" || protocol == "ISO 14230");
@@ -832,10 +858,10 @@ const J1962_CONNECTOR: c_ulong = 1;
 
 /// Build a RESOURCE_STRUCT for CAN on the standard J1962 OBD-II connector
 /// (CAN_H = pin 6, CAN_L = pin 14).
-fn can_j1962_resource(pin_buf: &[c_ulong; 2]) -> ResourceStruct {
+fn can_j1962_resource(pin_buf: &[c_ulong]) -> ResourceStruct {
     ResourceStruct {
         connector: J1962_CONNECTOR,
-        num_of_resources: 2,
+        num_of_resources: pin_buf.len() as u32,
         resource_list_ptr: pin_buf.as_ptr(),
     }
 }
@@ -890,11 +916,33 @@ type PassThruStartMsgFilterV0500Fn = unsafe extern "system" fn(
 type PassThruReadMsgsV0500Fn =
     unsafe extern "system" fn(c_ulong, *mut PassThruMsgV0500, *mut c_ulong, c_ulong) -> i32;
 type PassThruQueueMsgsFn =
-    unsafe extern "system" fn(c_ulong, *mut PassThruMsgV0500, *mut c_ulong, c_ulong) -> i32;
+    unsafe extern "system" fn(c_ulong, *mut PassThruMsgV0500, *mut c_ulong) -> i32;
 type PassThruWriteMsgsV0500Fn =
     unsafe extern "system" fn(c_ulong, *mut PassThruMsgV0500, *mut c_ulong, c_ulong) -> i32;
 type PassThruStartPeriodicMsgV0500Fn =
     unsafe extern "system" fn(c_ulong, *const PassThruMsgV0500, *mut c_ulong, c_ulong) -> i32;
+
+enum WriteV0500 {
+    Queue(PassThruQueueMsgsFn),
+    Write(PassThruWriteMsgsV0500Fn),
+}
+
+impl WriteV0500 {
+    unsafe fn call(
+        &self,
+        channel: u32,
+        messages: *mut PassThruMsgV0500,
+        count: *mut u32,
+        timeout: u32,
+    ) -> i32 {
+        // QueueMsgs has no timeout. Using the WriteMsgs signature corrupts the
+        // stdcall stack on x86 even though the extra argument is benign on x64.
+        match self {
+            Self::Queue(queue) => queue(channel, messages, count),
+            Self::Write(write) => write(channel, messages, count, timeout),
+        }
+    }
+}
 
 pub struct J2534Connection {
     library: Library,
@@ -912,6 +960,101 @@ pub struct J2534Connection {
 }
 
 impl J2534Connection {
+    fn validate_legacy_can(&self, arb_id: u32, data: &[u8], extended: bool) -> Result<(), String> {
+        if matches!(self.protocol_id, PROTOCOL_CAN | FD_CAN_PS) {
+            CanTxFrame {
+                arb_id,
+                data: data.to_vec(),
+                extended,
+                is_fd: false,
+                bitrate_switch: false,
+            }
+            .encode(self.protocol_id == FD_CAN_PS)?;
+        }
+        Ok(())
+    }
+
+    /// One validated write, preserving the driver's accepted count. No padding or truncation.
+    pub fn send_can_frames(&self, frames: &[CanTxFrame], timeout_ms: u32) -> Result<u32, String> {
+        if !matches!(self.protocol_id, PROTOCOL_CAN | FD_CAN_PS) {
+            return Err("ERR_J2534_CAN_PROTOCOL: raw CAN channel required".into());
+        }
+        if frames.len() > 256 || timeout_ms > 60_000 {
+            return Err("ERR_J2534_CAN_BATCH: maximum 256 frames and 60000 ms".into());
+        }
+        let encoded = frames
+            .iter()
+            .map(|f| f.encode(self.protocol_id == FD_CAN_PS))
+            .collect::<Result<Vec<_>, _>>()?;
+        if encoded.is_empty() {
+            return Ok(0);
+        }
+        let mut count = encoded.len() as u32;
+        let result = if self.is_v0500 {
+            let mut buffers: Vec<_> = encoded.iter().map(|(_, bytes)| bytes.clone()).collect();
+            let mut messages: Vec<_> = buffers
+                .iter_mut()
+                .zip(&encoded)
+                .map(|(buffer, (flags, _))| {
+                    let mut msg = PassThruMsgV0500::new(buffer);
+                    msg.protocol_id = self.protocol_id;
+                    msg.tx_flags = *flags;
+                    msg.data_length = buffer.len() as u32;
+                    msg.extra_data_index = msg.data_length;
+                    msg
+                })
+                .collect();
+            let write = Self::resolve_write_fn_v0500(&self.library)?;
+            unsafe {
+                write.call(
+                    self.channel_id,
+                    messages.as_mut_ptr(),
+                    &mut count,
+                    timeout_ms,
+                )
+            }
+        } else {
+            let mut messages: Vec<_> = encoded
+                .iter()
+                .map(|(flags, bytes)| {
+                    let mut msg = PassThruMsg {
+                        protocol_id: self.protocol_id,
+                        tx_flags: *flags,
+                        data_size: bytes.len() as u32,
+                        extra_data_index: bytes.len() as u32,
+                        ..Default::default()
+                    };
+                    msg.data[..bytes.len()].copy_from_slice(bytes);
+                    msg
+                })
+                .collect();
+            unsafe {
+                let write: Symbol<PassThruWriteMsgsFn> =
+                    self.library
+                        .get(b"PassThruWriteMsgs\0")
+                        .map_err(|e| function_not_found("PassThruWriteMsgs", e))?;
+                write(
+                    self.channel_id,
+                    messages.as_mut_ptr(),
+                    &mut count,
+                    timeout_ms,
+                )
+            }
+        };
+        if result != STATUS_NOERROR {
+            return Err(format!(
+                "{}; accepted={count}/{}",
+                api_call_error("WRITE_FAILED", result, Some(&self.library)),
+                frames.len()
+            ));
+        }
+        if count > frames.len() as u32 {
+            return Err("ERR_J2534_CAN_COUNT: invalid driver write count".into());
+        }
+        Ok(count)
+    }
+
+    #[allow(dead_code)] // Public direct-DLL API; the worker uses open_with_options.
     pub fn open(
         dll_path: &str,
         protocol_id: u32,
@@ -919,6 +1062,37 @@ impl J2534Connection {
         connect_flags: u32,
         progress_callback: impl Fn(J2534Progress),
     ) -> Result<Self, String> {
+        Self::open_with_options(
+            dll_path,
+            protocol_id,
+            baud_rate,
+            connect_flags,
+            None,
+            progress_callback,
+        )
+    }
+
+    pub fn open_with_options(
+        dll_path: &str,
+        protocol_id: u32,
+        baud_rate: u32,
+        connect_flags: u32,
+        options: Option<&CanOpenOptions>,
+        progress_callback: impl Fn(J2534Progress),
+    ) -> Result<Self, String> {
+        if let Some(options) = options {
+            options.validate()?;
+        }
+        if matches!(protocol_id, 0x1000c | 0x1000d | 0x8012) {
+            return Err("ERR_J2534_FD_DIALECT_UNSUPPORTED: use OpenCan for SAE raw FD_CAN_PS; GMW17753 and ISO-TP FD are not implemented".into());
+        }
+        if protocol_id == FD_CAN_PS && options.and_then(|o| o.data_bitrate).is_none() {
+            return Err("ERR_J2534_FD_CONFIG: use OpenCan with an explicit data bitrate".into());
+        }
+        let open_name = options
+            .and_then(|o| o.device_name.as_ref())
+            .map(|n| std::ffi::CString::new(n.as_str()).map_err(|e| e.to_string()))
+            .transpose()?;
         // Load the DLL
         progress_callback(J2534Progress {
             step: "load_dll".to_string(),
@@ -947,7 +1121,12 @@ impl J2534Connection {
                 .get(b"PassThruOpen\0")
                 .map_err(|e| function_not_found("PassThruOpen", e))?;
 
-            let result = open_fn(std::ptr::null(), &mut device_id);
+            let result = open_fn(
+                open_name
+                    .as_ref()
+                    .map_or(std::ptr::null(), |n| n.as_ptr().cast()),
+                &mut device_id,
+            );
             if result != STATUS_NOERROR {
                 return Err(api_call_error("OPEN_FAILED", result, Some(&library)));
             }
@@ -980,7 +1159,10 @@ impl J2534Connection {
                 .is_ok()
         };
 
-        let can_pins: [c_ulong; 2] = [6, 14]; // CAN_H, CAN_L on J1962
+        let mut can_pins: Vec<c_ulong> = vec![6, 14]; // CAN_H, CAN_L on J1962
+        if let Some(rate) = options.and_then(|o| o.data_bitrate) {
+            can_pins.push(rate);
+        }
         unsafe {
             let result = if is_v0500 {
                 let connect_fn: Symbol<PassThruConnectV0500Fn> = library
@@ -1027,12 +1209,56 @@ impl J2534Connection {
             message: Some(format!("Channel ID: {}", channel_id)),
         });
 
+        // Pin-switch FD channels become active only after data-rate and pin setup.
+        if let Some(data_rate) = options.and_then(|o| o.data_bitrate) {
+            let configure = (|| {
+                if !is_v0500 {
+                    Self::config_call(
+                        &library,
+                        channel_id,
+                        false,
+                        FD_CAN_DATA_PHASE_RATE,
+                        data_rate,
+                        false,
+                    )?;
+                    Self::config_call(&library, channel_id, false, J1962_PINS, 0x060e, false)?;
+                }
+                let actual = Self::config_call(
+                    &library,
+                    channel_id,
+                    is_v0500,
+                    FD_CAN_DATA_PHASE_RATE,
+                    0,
+                    true,
+                )?;
+                if actual != data_rate {
+                    return Err(format!(
+                        "ERR_J2534_FD_RATE: requested {data_rate}, driver reports {actual}"
+                    ));
+                }
+                Ok::<(), String>(())
+            })();
+            if let Err(error) = configure {
+                unsafe {
+                    if let Ok(disconnect) =
+                        library.get::<PassThruDisconnectFn>(b"PassThruDisconnect\0")
+                    {
+                        disconnect(channel_id);
+                    }
+                    if let Ok(close) = library.get::<PassThruCloseFn>(b"PassThruClose\0") {
+                        close(device_id);
+                    }
+                }
+                return Err(format!("ERR_J2534_FD_CONFIG: {error}"));
+            }
+        }
+
         // Set up pass-all message filter.
         // CAN protocols need a 4-byte (arb-id) mask/pattern.
         // ISO 9141 / ISO 14230 (K-Line) also need a filter — many J2534 drivers
         // will not deliver any PassThruReadMsgs data until at least one filter is
         // configured.  The can-opener klogger reference uses a 1-byte pass-all.
-        let is_can_protocol = protocol_id == PROTOCOL_CAN || protocol_id == PROTOCOL_ISO15765;
+        let is_can_protocol = is_can_protocol(protocol_id);
         let is_kline_protocol = protocol_id == PROTOCOL_ISO9141 || protocol_id == PROTOCOL_ISO14230;
         let needs_filter = is_can_protocol || is_kline_protocol;
 
@@ -1169,7 +1395,7 @@ impl J2534Connection {
         // to 29-bit frames.  Many adapters silently ignore CAN_ID_BOTH in the
         // connect flags, so a dedicated CAN_29BIT_ID channel is the most
         // reliable way to capture extended frames.
-        let channel_id_29bit = if connect_flags == CAN_ID_BOTH {
+        let channel_id_29bit = if protocol_id != FD_CAN_PS && connect_flags == CAN_ID_BOTH {
             let mut ch29: c_ulong = 0;
             let can_pins_29: [c_ulong; 2] = [6, 14];
             let res = if is_v0500 {
@@ -1259,19 +1485,10 @@ impl J2534Connection {
             message: Some("Disabling loopback (if supported)".to_string()),
         });
 
-        // v05.00 IOCTLs (GET_CONFIG/SET_CONFIG) crash on some DLLs (e.g. PEAK)
-        // due to struct layout expectations we haven't fully mapped yet.
-        // Skip loopback configuration for v05.00 — it's best-effort anyway.
-        let set_result = if is_v0500 {
-            Err("skipped (v0500 IOCTL not yet supported)".to_string())
-        } else {
-            conn.set_loopback(false)
-        };
-        let readback = if is_v0500 {
-            Err("skipped (v0500 IOCTL not yet supported)".to_string())
-        } else {
-            conn.get_loopback()
-        };
+        // Configuration lists use the revision-specific ABI; echo control
+        // remains best-effort and never implies electrical listen-only.
+        let set_result = conn.set_loopback(false);
+        let readback = conn.get_loopback();
         let message = match (set_result, readback) {
             (Ok(()), Ok(state)) => Some(format!(
                 "Loopback reported {}",
@@ -1397,13 +1614,16 @@ impl J2534Connection {
 
     /// Resolve the v05.00 write function.  Prefers `PassThruQueueMsgs` (v05.00 name)
     /// and falls back to `PassThruWriteMsgs` with the v05.00 struct layout.
-    fn resolve_write_fn_v0500(
-        library: &Library,
-    ) -> Result<Symbol<'_, PassThruQueueMsgsFn>, String> {
+    fn resolve_write_fn_v0500(library: &Library) -> Result<WriteV0500, String> {
         unsafe {
             library
                 .get::<PassThruQueueMsgsFn>(b"PassThruQueueMsgs\0")
-                .or_else(|_| library.get::<PassThruWriteMsgsV0500Fn>(b"PassThruWriteMsgs\0"))
+                .map(|function| WriteV0500::Queue(*function))
+                .or_else(|_| {
+                    library
+                        .get::<PassThruWriteMsgsV0500Fn>(b"PassThruWriteMsgs\0")
+                        .map(|function| WriteV0500::Write(*function))
+                })
                 .map_err(|e| {
                     format!(
                         "ERR_J2534_FUNC_NOT_FOUND: PassThruQueueMsgs/PassThruWriteMsgs - {}",
@@ -1421,7 +1641,7 @@ impl J2534Connection {
         data: &[u8],
         extended: bool,
     ) {
-        let is_can = protocol_id == PROTOCOL_CAN || protocol_id == PROTOCOL_ISO15765;
+        let is_can = is_can_protocol(protocol_id);
         if is_can {
             let data_len = data.len().min(8);
             let total = 4 + data_len;
@@ -1443,7 +1663,8 @@ impl J2534Connection {
     }
 
     pub fn send_message(&self, arb_id: u32, data: &[u8], extended: bool) -> Result<(), String> {
-        let is_can = self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765;
+        self.validate_legacy_can(arb_id, data, extended)?;
+        let is_can = is_can_protocol(self.protocol_id);
         let data_len;
 
         if self.is_v0500 {
@@ -1457,7 +1678,7 @@ impl J2534Connection {
             msg.extra_data_index = buf.len() as u32;
             let mut num_msgs: c_ulong = 1;
             let write_fn = Self::resolve_write_fn_v0500(&self.library)?;
-            let result = unsafe { write_fn(self.channel_id, &mut msg, &mut num_msgs, 1000) };
+            let result = unsafe { write_fn.call(self.channel_id, &mut msg, &mut num_msgs, 1000) };
             if result != STATUS_NOERROR {
                 return Err(format!(
                     "ERR_J2534_WRITE_FAILED: error code {} [{}]",
@@ -1525,11 +1746,14 @@ impl J2534Connection {
     /// Send multiple CAN messages in a single PassThruWriteMsgs call
     /// Returns the number of messages actually sent
     pub fn send_messages_batch(&self, messages: &[(u32, Vec<u8>, bool)]) -> Result<u32, String> {
+        for (id, data, extended) in messages {
+            self.validate_legacy_can(*id, data, *extended)?;
+        }
         if messages.is_empty() {
             return Ok(0);
         }
 
-        let is_can = self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765;
+        let is_can = is_can_protocol(self.protocol_id);
         let mut num_msgs: c_ulong = messages.len() as c_ulong;
 
         if self.is_v0500 {
@@ -1559,7 +1783,7 @@ impl J2534Connection {
             unsafe {
                 let write_fn = Self::resolve_write_fn_v0500(&self.library)?;
                 let timeout = 5000u32.max(messages.len() as u32 * 10);
-                let result = write_fn(
+                let result = write_fn.call(
                     self.channel_id,
                     msg_buffer.as_mut_ptr(),
                     &mut num_msgs,
@@ -1637,12 +1861,11 @@ impl J2534Connection {
             sent.retain(|m| m.timestamp > cutoff);
 
             for (arb_id, data, _) in messages.iter().take(num_msgs as usize) {
-                let data_len =
-                    if self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765 {
-                        data.len().min(8)
-                    } else {
-                        data.len()
-                    };
+                let data_len = if is_can_protocol(self.protocol_id) {
+                    data.len().min(8)
+                } else {
+                    data.len()
+                };
                 sent.push(SentMessage {
                     arb_id: *arb_id,
                     data: data[..data_len].to_vec(),
@@ -1660,6 +1883,9 @@ impl J2534Connection {
         messages: &[(u32, Vec<u8>, bool)],
         timeout_ms: u32,
     ) -> Result<RawIoResult, String> {
+        for (id, data, extended) in messages {
+            self.validate_legacy_can(*id, data, *extended)?;
+        }
         if messages.is_empty() {
             return Ok(RawIoResult {
                 result: STATUS_NOERROR,
@@ -1667,7 +1893,7 @@ impl J2534Connection {
             });
         }
 
-        let is_can = self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765;
+        let is_can = is_can_protocol(self.protocol_id);
         let mut num_msgs: c_ulong = messages.len() as c_ulong;
 
         let result = if self.is_v0500 {
@@ -1696,7 +1922,7 @@ impl J2534Connection {
 
             unsafe {
                 let write_fn = Self::resolve_write_fn_v0500(&self.library)?;
-                write_fn(
+                write_fn.call(
                     self.channel_id,
                     msg_buffer.as_mut_ptr(),
                     &mut num_msgs,
@@ -1754,12 +1980,11 @@ impl J2534Connection {
             sent.retain(|m| m.timestamp > cutoff);
 
             for (arb_id, data, _) in messages.iter().take(num_msgs as usize) {
-                let data_len =
-                    if self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765 {
-                        data.len().min(8)
-                    } else {
-                        data.len()
-                    };
+                let data_len = if is_can_protocol(self.protocol_id) {
+                    data.len().min(8)
+                } else {
+                    data.len()
+                };
                 sent.push(SentMessage {
                     arb_id: *arb_id,
                     data: data[..data_len].to_vec(),
@@ -1853,7 +2078,7 @@ impl J2534Connection {
         timeout_ms: u32,
         include_loopback: bool,
     ) -> Result<Vec<CANMessage>, String> {
-        let is_can = self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765;
+        let is_can = is_can_protocol(self.protocol_id);
         let mut messages = Vec::new();
 
         if self.is_v0500 {
@@ -1983,7 +2208,7 @@ impl J2534Connection {
                         | ((msg.data[2] as u32) << 8)
                         | (msg.data[3] as u32);
 
-                    let data_len = (msg.data_size - 4) as usize;
+                    let data_len = ((msg.data_size - 4) as usize).min(msg.data.len() - 4);
                     let data = msg.data[4..4 + data_len].to_vec();
                     let extended = (msg.rx_status & RX_CAN_29BIT_ID) != 0 || arb_id > 0x7FF;
 
@@ -2028,7 +2253,7 @@ impl J2534Connection {
                         continue;
                     }
 
-                    let data = msg.data[..msg.data_size as usize].to_vec();
+                    let data = msg.data[..(msg.data_size as usize).min(msg.data.len())].to_vec();
 
                     messages.push(CANMessage {
                         timestamp_us: msg.timestamp as u64,
@@ -2066,7 +2291,7 @@ impl J2534Connection {
     ) -> Result<Vec<CANMessage>, String> {
         let batch_size = batch_size.clamp(1, 256) as usize;
         let max_drain_reads = max_drain_reads.clamp(1, 256) as usize;
-        let is_can = self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765;
+        let is_can = is_can_protocol(self.protocol_id);
         let mut all_messages = Vec::new();
 
         if self.is_v0500 {
@@ -2273,7 +2498,7 @@ impl J2534Connection {
                             msg.data[2],
                             msg.data[3],
                         ]);
-                        let data_len = (msg.data_size - 4) as usize;
+                        let data_len = ((msg.data_size - 4) as usize).min(msg.data.len() - 4);
                         let data = msg.data[4..4 + data_len].to_vec();
                         let extended = (msg.rx_status & RX_CAN_29BIT_ID) != 0 || arb_id > 0x7FF;
 
@@ -2316,7 +2541,8 @@ impl J2534Connection {
                             continue;
                         }
 
-                        let data = msg.data[..msg.data_size as usize].to_vec();
+                        let data =
+                            msg.data[..(msg.data_size as usize).min(msg.data.len())].to_vec();
 
                         all_messages.push(CANMessage {
                             timestamp_us: msg.timestamp as u64,
@@ -2371,7 +2597,7 @@ impl J2534Connection {
                             msg.data[2],
                             msg.data[3],
                         ]);
-                        let data_len = (msg.data_size - 4) as usize;
+                        let data_len = ((msg.data_size - 4) as usize).min(msg.data.len() - 4);
                         let data = msg.data[4..4 + data_len].to_vec();
                         // Always extended on this channel
                         let extended = true;
@@ -2589,6 +2815,7 @@ impl J2534Connection {
         interval_ms: u32,
         extended: bool,
     ) -> Result<u32, String> {
+        self.validate_legacy_can(arb_id, data, extended)?;
         let mut msg_id: c_ulong = 0;
 
         if self.is_v0500 {
@@ -2827,83 +3054,92 @@ impl J2534Connection {
         Ok(())
     }
 
-    /// Get a configuration parameter value
-    pub fn get_config(&self, parameter: u32) -> Result<u32, String> {
-        let mut config = SConfig {
-            parameter,
-            value: 0,
-        };
-        let mut config_list = SConfigList {
+    /// Dispatch the packed 05.00 and native 04.04 configuration-list ABIs separately.
+    fn config_call(
+        library: &Library,
+        channel_id: u32,
+        is_v0500: bool,
+        parameter: u32,
+        value: u32,
+        get: bool,
+    ) -> Result<u32, String> {
+        let mut config = SConfig { parameter, value };
+        let mut native = SConfigList {
             num_of_params: 1,
             config_ptr: &mut config,
         };
-
+        let mut packed = SConfigListV0500 {
+            num_of_params: 1,
+            config_ptr: &mut config,
+        };
+        let input = if is_v0500 {
+            &mut packed as *mut _ as *mut c_void
+        } else {
+            &mut native as *mut _ as *mut c_void
+        };
         unsafe {
-            let ioctl_fn: Symbol<PassThruIoctlFn> = self
-                .library
+            let ioctl: Symbol<PassThruIoctlFn> = library
                 .get(b"PassThruIoctl\0")
-                .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruIoctl - {}", e))?;
-
-            let result = ioctl_fn(
-                self.channel_id,
-                GET_CONFIG,
-                &mut config_list as *mut SConfigList as *mut c_void,
+                .map_err(|e| function_not_found("PassThruIoctl", e))?;
+            let result = ioctl(
+                channel_id,
+                if get { GET_CONFIG } else { SET_CONFIG },
+                input,
                 std::ptr::null_mut(),
             );
-
             if result != STATUS_NOERROR {
                 return Err(format!(
-                    "ERR_J2534_GET_CONFIG_FAILED: error code {} ({})",
-                    result,
-                    error_code_to_string(result)
+                    "{}; parameter=0x{parameter:X} value={value} get={get}",
+                    api_call_error("CONFIG_FAILED", result, Some(library))
                 ));
             }
         }
-
         Ok(config.value)
     }
 
-    /// Set a configuration parameter value
+    pub fn get_config(&self, parameter: u32) -> Result<u32, String> {
+        Self::config_call(
+            &self.library,
+            self.channel_id,
+            self.is_v0500,
+            parameter,
+            0,
+            true,
+        )
+    }
+
     pub fn set_config(&self, parameter: u32, value: u32) -> Result<(), String> {
-        let mut config = SConfig { parameter, value };
-        let mut config_list = SConfigList {
-            num_of_params: 1,
-            config_ptr: &mut config,
-        };
-
-        unsafe {
-            let ioctl_fn: Symbol<PassThruIoctlFn> = self
-                .library
-                .get(b"PassThruIoctl\0")
-                .map_err(|e| format!("ERR_J2534_FUNC_NOT_FOUND: PassThruIoctl - {}", e))?;
-
-            let result = ioctl_fn(
-                self.channel_id,
-                SET_CONFIG,
-                &mut config_list as *mut SConfigList as *mut c_void,
-                std::ptr::null_mut(),
-            );
-
-            if result != STATUS_NOERROR {
-                return Err(format!(
-                    "ERR_J2534_SET_CONFIG_FAILED: error code {} ({})",
-                    result,
-                    error_code_to_string(result)
-                ));
-            }
-        }
-
-        Ok(())
+        Self::config_call(
+            &self.library,
+            self.channel_id,
+            self.is_v0500,
+            parameter,
+            value,
+            false,
+        )
+        .map(|_| ())
     }
 
     /// Get loopback setting
     pub fn get_loopback(&self) -> Result<bool, String> {
-        self.get_config(LOOPBACK).map(|v| v != 0)
+        self.get_config(if self.is_v0500 {
+            ECHO_PHYSICAL_CHANNEL_TX
+        } else {
+            LOOPBACK
+        })
+        .map(|v| v != 0)
     }
 
     /// Set loopback setting
     pub fn set_loopback(&self, enabled: bool) -> Result<(), String> {
-        self.set_config(LOOPBACK, if enabled { 1 } else { 0 })
+        self.set_config(
+            if self.is_v0500 {
+                ECHO_PHYSICAL_CHANNEL_TX
+            } else {
+                LOOPBACK
+            },
+            if enabled { 1 } else { 0 },
+        )
     }
 
     /// Get the current data rate
@@ -2942,7 +3178,7 @@ impl J2534Connection {
                     ));
                 }
             }
-            let is_can = self.protocol_id == PROTOCOL_CAN || self.protocol_id == PROTOCOL_ISO15765;
+            let is_can = is_can_protocol(self.protocol_id);
             output
                 .to_can_message(is_can)
                 .ok_or_else(|| "ERR_J2534_FAST_INIT_FAILED: empty response".to_string())
@@ -3203,6 +3439,101 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fd_payload_and_status_survive_both_message_layouts() {
+        let payload: Vec<u8> = (0..64).collect();
+        let mut native = PassThruMsg {
+            protocol_id: FD_CAN_PS,
+            data_size: 68,
+            rx_status: CAN_29BIT_ID
+                | crate::can::FD_CAN_FORMAT
+                | crate::can::FD_CAN_BRS
+                | crate::can::FD_CAN_ESI,
+            ..Default::default()
+        };
+        native.data[..4].copy_from_slice(&0x123u32.to_be_bytes());
+        native.data[4..68].copy_from_slice(&payload);
+        let decoded = passthru_msg_to_can_message(&native);
+        assert_eq!(decoded.data, payload);
+        assert_eq!(decoded.arb_id, 0x123);
+        assert!(decoded.extended);
+        let mut bytes = native.data[..68].to_vec();
+        let mut v5 = PassThruMsgV0500::new(&mut bytes);
+        // Constructing the descriptor must never erase a prepared transmit payload.
+        assert_eq!(&bytes[4..], payload);
+        v5.protocol_id = FD_CAN_PS;
+        v5.data_length = 68;
+        v5.rx_status = native.rx_status;
+        let converted = v5.to_can_message(true).unwrap();
+        assert_eq!(converted.data, decoded.data);
+        assert_eq!(converted.rx_status, decoded.rx_status);
+        v5.data_length = 69;
+        assert!(v5.to_can_message(true).is_none());
+    }
+
+    #[test]
+    fn v0500_queue_and_legacy_write_use_distinct_calling_conventions() {
+        unsafe extern "system" fn queue(
+            channel: u32,
+            _: *mut PassThruMsgV0500,
+            count: *mut u32,
+        ) -> i32 {
+            assert_eq!(channel, 7);
+            *count = 2;
+            0
+        }
+        unsafe extern "system" fn write(
+            channel: u32,
+            _: *mut PassThruMsgV0500,
+            count: *mut u32,
+            timeout: u32,
+        ) -> i32 {
+            assert_eq!(channel, 7);
+            assert_eq!(timeout, 500);
+            *count = 3;
+            0
+        }
+        let mut count = 0;
+        unsafe {
+            assert_eq!(
+                WriteV0500::Queue(queue).call(7, std::ptr::null_mut(), &mut count, 500),
+                0
+            );
+            assert_eq!(count, 2);
+            assert_eq!(
+                WriteV0500::Write(write).call(7, std::ptr::null_mut(), &mut count, 500),
+                0
+            );
+            assert_eq!(count, 3);
+        }
+    }
+
+    #[test]
+    fn config_list_packing_is_revision_specific() {
+        let packed = SConfigListV0500 {
+            num_of_params: 1,
+            config_ptr: std::ptr::null_mut(),
+        };
+        let base = &packed as *const _ as usize;
+        assert_eq!(std::ptr::addr_of!(packed.config_ptr) as usize - base, 4);
+        assert_eq!(
+            std::mem::size_of::<SConfigListV0500>(),
+            4 + std::mem::size_of::<usize>()
+        );
+        let native = SConfigList {
+            num_of_params: 1,
+            config_ptr: std::ptr::null_mut(),
+        };
+        let base = &native as *const _ as usize;
+        assert_eq!(
+            std::ptr::addr_of!(native.config_ptr) as usize - base,
+            std::mem::size_of::<usize>()
+        );
+        let pins = [6, 14, 4_000_000];
+        let resource = can_j1962_resource(&pins);
+        assert_eq!(resource.num_of_resources, 3);
+    }
+
+    #[test]
     fn error_code_to_string_covers_known_and_unknown_values() {
         assert_eq!(error_code_to_string(STATUS_NOERROR), "STATUS_NOERROR");
         assert_eq!(error_code_to_string(ERR_TIMEOUT), "ERR_TIMEOUT");
@@ -3218,11 +3549,13 @@ mod tests {
 
     #[test]
     fn passthru_can_messages_extract_header_and_payload() {
-        let mut msg = PassThruMsg::default();
-        msg.protocol_id = PROTOCOL_CAN;
-        msg.rx_status = RX_CAN_29BIT_ID;
-        msg.timestamp = 1234;
-        msg.data_size = 7;
+        let mut msg = PassThruMsg {
+            protocol_id: PROTOCOL_CAN,
+            rx_status: RX_CAN_29BIT_ID,
+            timestamp: 1234,
+            data_size: 7,
+            ..Default::default()
+        };
         msg.data[..7].copy_from_slice(&[0x18, 0xDA, 0xF1, 0x10, 0x22, 0xF1, 0x90]);
 
         let can = passthru_msg_to_can_message(&msg);
@@ -3237,10 +3570,12 @@ mod tests {
 
     #[test]
     fn passthru_non_can_messages_preserve_raw_payload() {
-        let mut msg = PassThruMsg::default();
-        msg.protocol_id = PROTOCOL_ISO14230;
-        msg.timestamp = 55;
-        msg.data_size = 3;
+        let mut msg = PassThruMsg {
+            protocol_id: PROTOCOL_ISO14230,
+            timestamp: 55,
+            data_size: 3,
+            ..Default::default()
+        };
         msg.data[..3].copy_from_slice(&[0x83, 0xF1, 0x01]);
 
         let can = passthru_msg_to_can_message(&msg);

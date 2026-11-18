@@ -24,6 +24,63 @@ pub struct BridgeClient {
 }
 
 impl BridgeClient {
+    pub fn enumerate_native_can_devices(
+        &mut self,
+    ) -> Result<Vec<crate::protocol::NativeCanDeviceInfo>, String> {
+        match self.send_request(Request::EnumerateNativeCanDevices)? {
+            Response::Ok {
+                data:
+                    ResponseData::NativeDevices {
+                        native_devices: devices,
+                    },
+            } => Ok(devices),
+            Response::Error { message, .. } => Err(message),
+            _ => Err("Unexpected native CAN inventory response".into()),
+        }
+    }
+
+    pub fn open_native_can(
+        &mut self,
+        selector: &str,
+        options: crate::can::CanOpenOptions,
+    ) -> Result<(), String> {
+        options.validate_rates()?;
+        match self.send_request(Request::OpenNativeCan {
+            selector: selector.into(),
+            options,
+        })? {
+            Response::Ok { .. } => Ok(()),
+            Response::Error { message, .. } => Err(message),
+        }
+    }
+    pub fn open_can(
+        &mut self,
+        dll_path: &str,
+        options: crate::can::CanOpenOptions,
+    ) -> Result<(), String> {
+        options.validate()?;
+        match self.send_request(Request::OpenCan {
+            dll_path: dll_path.into(),
+            options,
+        })? {
+            Response::Ok { .. } => Ok(()),
+            Response::Error { message, .. } => Err(message),
+        }
+    }
+
+    pub fn send_can_frames(
+        &mut self,
+        frames: Vec<crate::can::CanTxFrame>,
+        timeout_ms: u32,
+    ) -> Result<u32, String> {
+        match self.send_request(Request::SendCanFrames { frames, timeout_ms })? {
+            Response::Ok {
+                data: ResponseData::Number(count),
+            } => Ok(count),
+            Response::Error { message, .. } => Err(message),
+            _ => Err("Unexpected CAN write response".into()),
+        }
+    }
     /// Create a new bridge client (doesn't start the bridge yet)
     pub fn new() -> Self {
         use std::sync::atomic::AtomicU64 as Counter;
@@ -866,75 +923,6 @@ impl BridgeClient {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn new_clients_use_unique_pipe_names() {
-        let first = BridgeClient::new();
-        let second = BridgeClient::new();
-
-        assert_ne!(first.pipe_name, second.pipe_name);
-        assert!(first.pipe_name.starts_with("\\\\.\\pipe\\j2534-bridge-"));
-        assert!(second.pipe_name.starts_with("\\\\.\\pipe\\j2534-bridge-"));
-    }
-
-    #[test]
-    fn stop_without_start_is_a_noop() {
-        let mut client = BridgeClient::new();
-
-        assert!(client.stop().is_ok());
-        assert!(!client.is_running());
-    }
-
-    #[cfg(windows)]
-    fn test_pipe() -> (std::fs::File, std::fs::File) {
-        use windows::Win32::{Foundation::HANDLE, System::Pipes::CreatePipe};
-        let mut read = HANDLE::default();
-        let mut write = HANDLE::default();
-        unsafe {
-            CreatePipe(&mut read, &mut write, None, 0).unwrap();
-            (
-                std::fs::File::from_raw_handle(read.0),
-                std::fs::File::from_raw_handle(write.0),
-            )
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn response_deadline_handles_buffered_lines_and_stalled_partial_replies() {
-        let (read, mut write) = test_pipe();
-        let mut reader = BufReader::new(read);
-        write.write_all(b"first\nsecond\npartial").unwrap();
-        let mut line = String::new();
-        let timeout = std::time::Duration::from_millis(50);
-        read_line_with_timeout(&mut reader, &mut line, timeout).unwrap();
-        assert_eq!(line, "first\n");
-        read_line_with_timeout(&mut reader, &mut line, timeout).unwrap();
-        assert_eq!(line, "second\n");
-        let start = std::time::Instant::now();
-        assert!(read_line_with_timeout(&mut reader, &mut line, timeout)
-            .unwrap_err()
-            .contains("timed out"));
-        assert!(start.elapsed() < std::time::Duration::from_secs(1));
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn start_returns_clear_error_on_non_windows() {
-        let mut client = BridgeClient::new();
-
-        assert_eq!(
-            client.start(64).unwrap_err(),
-            "Bridge client is only supported on Windows"
-        );
-    }
-}
-
-// Peek before each fill, not just before read_line: a DLL can stop after a
-// partial JSON reply. Buffered bytes must also be consumed before peeking.
 #[cfg(windows)]
 fn read_line_with_timeout(
     reader: &mut BufReader<std::fs::File>,
@@ -1009,3 +997,73 @@ impl Default for BridgeClient {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_clients_use_unique_pipe_names() {
+        let first = BridgeClient::new();
+        let second = BridgeClient::new();
+
+        assert_ne!(first.pipe_name, second.pipe_name);
+        assert!(first.pipe_name.starts_with("\\\\.\\pipe\\j2534-bridge-"));
+        assert!(second.pipe_name.starts_with("\\\\.\\pipe\\j2534-bridge-"));
+    }
+
+    #[test]
+    fn stop_without_start_is_a_noop() {
+        let mut client = BridgeClient::new();
+
+        assert!(client.stop().is_ok());
+        assert!(!client.is_running());
+    }
+
+    #[cfg(windows)]
+    fn test_pipe() -> (std::fs::File, std::fs::File) {
+        use windows::Win32::{Foundation::HANDLE, System::Pipes::CreatePipe};
+        let mut read = HANDLE::default();
+        let mut write = HANDLE::default();
+        unsafe {
+            CreatePipe(&mut read, &mut write, None, 0).unwrap();
+            (
+                std::fs::File::from_raw_handle(read.0),
+                std::fs::File::from_raw_handle(write.0),
+            )
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn response_deadline_handles_buffered_lines_and_stalled_partial_replies() {
+        let (read, mut write) = test_pipe();
+        let mut reader = BufReader::new(read);
+        write.write_all(b"first\nsecond\npartial").unwrap();
+        let mut line = String::new();
+        let timeout = std::time::Duration::from_millis(50);
+        read_line_with_timeout(&mut reader, &mut line, timeout).unwrap();
+        assert_eq!(line, "first\n");
+        read_line_with_timeout(&mut reader, &mut line, timeout).unwrap();
+        assert_eq!(line, "second\n");
+        let start = std::time::Instant::now();
+        assert!(read_line_with_timeout(&mut reader, &mut line, timeout)
+            .unwrap_err()
+            .contains("timed out"));
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn start_returns_clear_error_on_non_windows() {
+        let mut client = BridgeClient::new();
+
+        assert_eq!(
+            client.start(64).unwrap_err(),
+            "Bridge client is only supported on Windows"
+        );
+    }
+}
+
+// Peek before each fill, not just before read_line: a DLL can stop after a
+// partial JSON reply. Buffered bytes must also be consumed before peeking.
