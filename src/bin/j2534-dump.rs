@@ -335,9 +335,12 @@ mod app {
             Some(select_device(&mut bridge, &cli)?)
         };
         let dll_path = selected.as_ref().map(|d| d.dll_path.as_str()).unwrap_or("");
-        let bitness = cli
-            .bitness
-            .unwrap_or(selected.as_ref().map(|d| d.bitness).unwrap_or(64));
+        let bitness = cli.bitness.unwrap_or(
+            selected
+                .as_ref()
+                .map(|d| d.bitness)
+                .unwrap_or(initial_bitness),
+        );
         if bitness != initial_bitness {
             bridge.stop()?;
             bridge.start(bitness)?;
@@ -1209,7 +1212,7 @@ mod app {
             return detect_pe_bitness(dll_path)
                 .map_err(|e| format!("Failed to detect DLL bitness for {dll_path}: {e}"));
         }
-        Ok(64)
+        Ok(usize::BITS as u8)
     }
 
     fn validate_bitness(bits: u8) -> Result<u8, String> {
@@ -1384,6 +1387,14 @@ mod app {
     #[cfg(test)]
     mod tests {
         use super::*;
+        #[test]
+        fn native_discovery_uses_the_cli_architecture_unless_overridden() {
+            let cli = Cli::try_parse_from(["j2534-dump", "--list-native"]).unwrap();
+            assert_eq!(resolve_initial_bitness(&cli).unwrap(), usize::BITS as u8);
+            let cli =
+                Cli::try_parse_from(["j2534-dump", "--list-native", "--bitness", "32"]).unwrap();
+            assert_eq!(resolve_initial_bitness(&cli).unwrap(), 32);
+        }
         #[test]
         fn fd_candump_parser_and_formatter_preserve_wire_flags() {
             let frame = parse_can_frame("00000123##1".to_owned().as_str()).unwrap();
