@@ -1,14 +1,32 @@
 # j2534-bridge
 
-Out-of-process J2534 PassThru bridge for cross-bitness DLL loading and fault isolation.
+Out-of-process Windows CAN bridge with cross-bitness J2534 PassThru and a native gs_usb backend.
 
 This crate is maintained as `packages/j2534-bridge` inside the CANsole monorepo.
 It supersedes the former nested CANcorder submodule and is shared by CANcorder,
-Studio, and the Python J2534 backend.
+Studio, and the C++ desktop runtime. The repository also builds standalone
+Windows helpers and diagnostic tools; it does not require a CANsole checkout.
 
-Raw CAN-FD through SAE J2534 and a built-in native Windows gs_usb backend now
-share the bridge's CAN API. See [the API and bench tools](docs/raw-can-fd.md)
-for supported dialects, access modes, exact frame semantics and hardware tests.
+## Version 1.1.0
+
+- Raw Classic CAN and SAE J2534 CAN FD, including 64-byte payloads, BRS and ESI
+  metadata, with both 32-bit and 64-bit vendor drivers.
+- Native Windows gs_usb/candleLight access through libusb/WinUSB, without a
+  vendor J2534 DLL. Discovery reports actual FD, listen-only and timestamp
+  capabilities and preserves known devices while a capture owns WinUSB.
+- A C ABI for native hosts, alongside the Rust client and named-pipe protocol.
+- CANsole's Windows CANcorder picker and Studio runtime inventory/open paths
+  integrate the native backend. Existing installed product releases need an
+  updated application/runtime and matching bridge helpers to use it.
+
+On the isolated PCAN-USB Pro FD / candleLightFD bench, 500 kbit/s arbitration
+and 2 Mbit/s data with BRS passed bidirectional exact-frame and reopen tests.
+**4 Mbit/s BRS is not accepted**: it failed on this Windows bench and required
+USB power cycling to recover the candleLightFD. No general electrical silent-mode,
+sustained-load or suspend/resume acceptance is implied.
+
+See [the raw-CAN API and bench tools](docs/raw-can-fd.md) for exact contracts,
+SAE versus GMW dialects, test commands and remaining limits.
 
 ## What it does
 
@@ -21,28 +39,33 @@ This crate solves that by running the J2534 DLL in a **separate bridge process**
 - **Cross-bitness**: 64-bit app uses 32-bit J2534 DLLs (and vice versa) by spawning the matching bridge executable.
 - **Fault isolation**: A buggy or crashing J2534 DLL kills only the bridge process, not your application. Panics inside DLL calls are caught via `catch_unwind`.
 - **High-throughput capture**: The `read_messages_drain` command performs a tight drain loop inside the bridge (batch 256 messages, up to 64 iterations per poll), avoiding packet loss during passive CAN bus logging.
-- **Full API coverage**: Connect, read, write, filters, periodic messages, IOCTL, version/voltage queries, loopback control, and configuration parameters.
+- **J2534 API support**: Connect, read, write, filters, periodic messages, IOCTL, version/voltage queries, loopback control, and configuration parameters.
 
 ## Architecture
 
-```
-+------------------+          named pipe          +------------------+
-|   Host App       |  <--- JSON-RPC/newline --->  |  j2534-bridge    |
-|  (any bitness)   |                              |  (matches DLL)   |
-|                  |                              |                  |
-|  BridgeClient    |                              |  J2534Connection |
-|  (client.rs)     |                              |  (j2534.rs)      |
-+------------------+                              +------------------+
-                                                         |
-                                                    LoadLibrary
-                                                         |
-                                                  +------v-------+
-                                                  | J2534 DLL    |
-                                                  | (vendor)     |
-                                                  +--------------+
+```text
+Rust / C / C++ host
+        |
+        | named pipe: newline-delimited JSON requests and responses
+        v
+j2534-bridge-32.exe / j2534-bridge-64.exe
+        |
+        +-- J2534 backend --> vendor PassThru DLL --> CAN adapter
+        |
+        +-- native gs_usb --> libusb / WinUSB --> candleLight / compatible USB CAN
 ```
 
-The host application uses `BridgeClient` to spawn the bridge process and send requests. The bridge loads the J2534 DLL, calls the PassThru API functions, and returns results over the pipe.
+J2534 helpers match the vendor DLL's architecture. Native gs_usb normally uses
+an x64 helper. Both backends share raw-frame send/read and lifecycle commands;
+J2534-specific operations are rejected by the native backend. This is **not a
+J2534 driver DLL** for arbitrary third-party PassThru applications.
+
+Windows must already have a compatible USB driver for the gs_usb device
+(the tested candleLightFD uses WinUSB). The bridge does not install drivers or
+change driver bindings. It currently supports the first CAN channel only.
+Discovery reads USB descriptors and capability bits without starting or resetting
+CAN. If WinUSB denies an additional handle to a known, still-present adapter,
+its previous discovery snapshot remains available until unplugged.
 
 ## Crate structure
 
@@ -53,6 +76,10 @@ The crate provides both a **library** (for host applications) and a **binary** (
 | `protocol.rs` | Shared IPC types: `Request`, `Response`, `Message`, `CanMessage`, etc. |
 | `client.rs` | `BridgeClient` — spawns the bridge, connects via named pipe, sends requests. |
 | `j2534.rs` | `J2534Connection` — FFI wrapper for the PassThru API, device enumeration, drain-loop reader. |
+| `gs_usb.rs` | Native USB discovery, controller timing, Classic/FD framing and device lifecycle. |
+| `can.rs` | Shared raw-CAN options, exact-length validation and FD flag definitions. |
+| `c_api.rs` | C ABI for native host clients; public header in `include/j2534_bridge.h`. |
+| `worker.rs` | Isolated channel workers and bounded receive queues. |
 | `main.rs` | Bridge executable entry point: named pipe server, JSON-RPC message loop. |
 
 Host applications depend on the library for `client` and `protocol` modules. In
@@ -99,11 +126,14 @@ The `BridgeClient` searches for bridge executables in the following order:
 3. `apps/cancorder/src-tauri/bin/` staged development resources
 4. Development paths under `packages/j2534-bridge/target/`
 
-The crate is Windows-specific. On macOS/Linux, validate with a Windows target:
+Runtime helpers and the C ABI are Windows-specific. Portable library tests also
+run on Linux/macOS; macOS additionally has a USB enumeration tool. Validate the
+Windows implementation on Windows with both target architectures:
 
 ```bash
-rustup target add x86_64-pc-windows-msvc
-cargo check --manifest-path packages/j2534-bridge/Cargo.toml --target x86_64-pc-windows-msvc
+rustup target add x86_64-pc-windows-msvc i686-pc-windows-msvc
+cargo test --all-targets --target x86_64-pc-windows-msvc
+cargo test --all-targets --target i686-pc-windows-msvc
 ```
 
 ## Protocol
@@ -153,7 +183,7 @@ Each message has an `id` field for request/response matching:
 
 ### Supported commands
 
-`EnumerateDevices`, `Open`, `Close`, `SendMessage`, `SendMessagesBatch`, `WriteMessagesRaw`, `ReadMessages` (with drain parameters), `ReadMessagesWithLoopback`, `ReadMessagesRaw`, `ClearBuffers`, `ReadVersion`, `GetLastError`, `ReadBatteryVoltage`, `ReadProgrammingVoltage`, `StartPeriodicMessage`, `StopPeriodicMessage`, `ClearPeriodicMessages`, `AddFilter`, `AddFilterRaw`, `RemoveFilter`, `ClearFilters`, `GetConfig`, `SetConfig`, `GetLoopback`, `SetLoopback`, `GetDataRate`, `Shutdown`.
+`EnumerateDevices`, `EnumerateNativeCanDevices`, `OpenCan`, `OpenNativeCan`, `SendCanFrames`, `Open`, `Close`, `SendMessage`, `SendMessagesBatch`, `WriteMessagesRaw`, `ReadMessages` (with drain parameters), `ReadMessagesWithLoopback`, `ReadMessagesRaw`, `ClearBuffers`, `ReadVersion`, `GetLastError`, `ReadBatteryVoltage`, `ReadProgrammingVoltage`, `StartPeriodicMessage`, `StopPeriodicMessage`, `ClearPeriodicMessages`, `AddFilter`, `AddFilterRaw`, `RemoveFilter`, `ClearFilters`, `GetConfig`, `SetConfig`, `GetLoopback`, `SetLoopback`, `GetDataRate`, `Shutdown`.
 
 ## Test tool (`j2534-dump`)
 
@@ -172,6 +202,27 @@ make dump-stress-loopback DEVICE='OpenPort 2.0 J2534 ISO/CAN/VPW/PWM' BITNESS=32
 # Push harder: 5000 frames, zero delay
 make dump-stress-loopback DEVICE='...' BITNESS=32 EXTRA='--loopback-count 5000 --loopback-interval-ms 0'
 ```
+
+### Native gs_usb and CAN FD on Windows
+
+```powershell
+cargo run --bin j2534-dump -- --list-native
+cargo run --bin j2534-dump -- --native 'gs_usb:1d50:606f:SERIAL' --can-fd --baud-rate 500000 --data-baud-rate 2000000 --duration-secs 5
+```
+
+Use the selector returned by discovery. Capture opens an ACK-capable controller;
+add `--listen-only` for supported native devices when electrical silence is
+required. J2534 listen-only is refused because disabling TX echo does not
+suppress ACK. FD support is queried from the device, not assumed from its name.
+No termination control, RTR, GMW17753 FD or ISO-TP FD is implemented here.
+
+### Release binaries
+
+[GitHub releases](https://github.com/mickeyl/j2534-bridge/releases) provide
+Windows x64/x86 archives with the matching helper, `j2534-dump`, static C ABI
+library, header and documentation. Stage both `j2534-bridge-32.exe` and
+`j2534-bridge-64.exe` beside your host to use vendor DLLs of either architecture.
+The archives include SHA-256 checksums; they are not Authenticode-signed installers.
 
 ### Available Makefile targets
 

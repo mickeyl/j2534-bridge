@@ -255,6 +255,12 @@ pub struct NativeCanDeviceInfo {
     pub name: String,
     pub serial: String,
     pub backend: String,
+    #[serde(default)]
+    pub supports_can_fd: bool,
+    #[serde(default)]
+    pub supports_listen_only: bool,
+    #[serde(default)]
+    pub supports_hardware_timestamps: bool,
 }
 
 /// Raw J2534 result payload

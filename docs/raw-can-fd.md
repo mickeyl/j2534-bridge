@@ -8,8 +8,12 @@ Windows USB drivers are not changed by the bridge.
 ## API
 
 - `EnumerateNativeCanDevices` returns `{ native_devices: [...] }`. Each entry has
-  `selector`, `name`, `serial`, and `backend`. This reads USB descriptors without
-  starting the controller. It makes no FD-capability claim before opening.
+  `selector`, `name`, `serial`, `backend`, `supports_can_fd`,
+  `supports_listen_only` and `supports_hardware_timestamps`. Discovery reads USB
+  descriptors and timing capability bits without claiming, resetting or starting
+  the controller. Unknown capability bits default to false. Known devices retain
+  their snapshot while an active WinUSB owner denies a second handle; unplugged
+  devices leave the inventory. Opening validates the requested mode again.
 - `OpenCan { dll_path, options }` selects raw Classic CAN or SAE `FD_CAN_PS`
   (`0x8011`). `options` contains `nominal_bitrate`, optional `data_bitrate`, optional
   vendor `device_name`, and `listen_only` (default false). Supplying `data_bitrate`

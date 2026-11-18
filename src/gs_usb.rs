@@ -3,6 +3,8 @@
 use crate::can::{CanOpenOptions, CanTxFrame, FD_CAN_BRS, FD_CAN_ESI, FD_CAN_FORMAT, FD_CAN_PS};
 use crate::protocol::{CanMessage, NativeCanDeviceInfo};
 use rusb::{DeviceHandle, GlobalContext};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const TIMEOUT: Duration = Duration::from_secs(1);
@@ -312,8 +314,19 @@ impl Drop for GsUsb {
     }
 }
 
-/// USB-descriptor inventory only; does not start a CAN controller or probe in a loop.
+/// Read USB descriptors and timing capability bits without claiming, resetting,
+/// configuring or starting a CAN controller. Never write during discovery.
 pub fn enumerate() -> Result<Vec<NativeCanDeviceInfo>, String> {
+    // WinUSB denies a second handle while a worker owns the interface. Keep a
+    // previously read identity/capability snapshot for that still-present USB
+    // address; remove it as soon as the device disappears from enumeration.
+    type UsbLocation = (u8, u8, u16, u16);
+    static CACHE: OnceLock<Mutex<HashMap<UsbLocation, NativeCanDeviceInfo>>> = OnceLock::new();
+    let mut cache = CACHE
+        .get_or_init(Mutex::default)
+        .lock()
+        .map_err(|e| e.to_string())?;
+    let mut present = HashMap::new();
     let mut result = vec![];
     for device in rusb::devices().map_err(|e| e.to_string())?.iter() {
         let descriptor = match device.device_descriptor() {
@@ -322,6 +335,7 @@ pub fn enumerate() -> Result<Vec<NativeCanDeviceInfo>, String> {
         };
         let vid = descriptor.vendor_id();
         let pid = descriptor.product_id();
+        let location = (device.bus_number(), device.address(), vid, pid);
         if !matches!(
             (vid, pid),
             (0x1d50, 0x606f)
@@ -336,16 +350,32 @@ pub fn enumerate() -> Result<Vec<NativeCanDeviceInfo>, String> {
         ) {
             continue;
         }
-        let handle = device
-            .open()
-            .map_err(|e| format!("USB inventory {vid:04x}:{pid:04x}: {e}"))?;
+        let handle = match device.open() {
+            Ok(handle) => handle,
+            Err(error) => {
+                if matches!(error, rusb::Error::Access | rusb::Error::Busy) {
+                    if let Some(previous) = cache.get(&location) {
+                        present.insert(location, previous.clone());
+                        result.push(previous.clone());
+                        continue;
+                    }
+                }
+                eprintln!("USB inventory {vid:04x}:{pid:04x}: {error}");
+                continue; // One inaccessible device must not hide other adapters.
+            }
+        };
         let serial = handle
             .read_serial_number_string_ascii(&descriptor)
             .unwrap_or_default();
         let name = handle
             .read_product_string_ascii(&descriptor)
             .unwrap_or_else(|_| "gs_usb".into());
-        result.push(NativeCanDeviceInfo {
+        let mut constants = [0; 40];
+        let features = match handle.read_control(0xc1, 4, 0, 0, &mut constants, TIMEOUT) {
+            Ok(40) => word(&constants, 0),
+            _ => 0, // Do not infer FD or silent-mode support from a USB product ID.
+        };
+        let info = NativeCanDeviceInfo {
             selector: format!(
                 "gs_usb:{vid:04x}:{pid:04x}:{}",
                 if serial.is_empty() { "*" } else { &serial }
@@ -353,8 +383,14 @@ pub fn enumerate() -> Result<Vec<NativeCanDeviceInfo>, String> {
             name,
             serial,
             backend: "gs_usb".into(),
-        });
+            supports_can_fd: features & 0x500 == 0x500,
+            supports_listen_only: features & 1 != 0,
+            supports_hardware_timestamps: features & 0x10 != 0,
+        };
+        present.insert(location, info.clone());
+        result.push(info);
     }
+    *cache = present;
     Ok(result)
 }
 

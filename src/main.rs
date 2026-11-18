@@ -33,6 +33,14 @@ fn is_verbose() -> bool {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == "--version" || arg == "-V")
+    {
+        println!("j2534-bridge {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     if args.len() < 2 {
         eprintln!("Usage: j2534-bridge.exe <pipe_name>");
         eprintln!("Example: j2534-bridge.exe \\\\.\\pipe\\cancorder-j2534-1234");
